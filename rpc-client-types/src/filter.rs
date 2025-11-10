@@ -1,8 +1,6 @@
 use {
     base64::{prelude::BASE64_STANDARD, Engine},
-    serde::Deserialize,
-    solana_account::{AccountSharedData, ReadableAccount},
-    spl_generic_token::{token::GenericTokenAccount, token_2022::Account},
+    serde::{Deserialize, Serialize},
     std::borrow::Cow,
     thiserror::Error,
 };
@@ -57,18 +55,6 @@ impl RpcFilterType {
                 }
             }
             RpcFilterType::TokenAccountState => Ok(()),
-        }
-    }
-
-    #[deprecated(
-        since = "2.0.0",
-        note = "Use solana_rpc::filter::filter_allows instead"
-    )]
-    pub fn allows(&self, account: &AccountSharedData) -> bool {
-        match self {
-            RpcFilterType::DataSize(size) => account.data().len() as u64 == *size,
-            RpcFilterType::Memcmp(compare) => compare.bytes_match(account.data()),
-            RpcFilterType::TokenAccountState => Account::valid_account_data(account.data()),
         }
     }
 }
@@ -168,7 +154,7 @@ impl Memcmp {
         self.offset
     }
 
-    pub fn bytes(&self) -> Option<Cow<Vec<u8>>> {
+    pub fn bytes(&self) -> Option<Cow<'_, Vec<u8>>> {
         use MemcmpEncodedBytes::*;
         match &self.bytes {
             Base58(bytes) => bs58::decode(bytes).into_vec().ok().map(Cow::Owned),

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 use {
     agave_feature_set::{enable_secp256r1_precompile, FeatureSet},
     solana_fee_structure::FeeDetails,
@@ -63,7 +72,7 @@ pub fn calculate_fee_details(
 }
 
 /// Calculate fees from signatures.
-fn calculate_signature_fee(
+pub fn calculate_signature_fee(
     SignatureCounts {
         num_transaction_signatures,
         num_ed25519_signatures,
@@ -82,7 +91,7 @@ fn calculate_signature_fee(
     signature_count.saturating_mul(lamports_per_signature)
 }
 
-struct SignatureCounts {
+pub struct SignatureCounts {
     pub num_transaction_signatures: u64,
     pub num_ed25519_signatures: u64,
     pub num_secp256k1_signatures: u64,

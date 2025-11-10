@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 use {
     anyhow::Ok,
     serde::{Deserialize, Serialize},
@@ -220,14 +229,14 @@ mod tests {
                 .read_to_string(&mut buf)
                 .unwrap();
             let cfg: ThreadManagerConfig = toml::from_str(&buf).unwrap();
-            println!("{:?}", cfg);
+            println!("{cfg:?}");
         }
     }
     // Nobody runs Agave on windows, and on Mac we can not set mask affinity without patching external crate
     #[cfg(target_os = "linux")]
     fn validate_affinity(expect_cores: &[usize], error_msg: &str) {
         let affinity = affinity::get_thread_affinity().unwrap();
-        assert_eq!(affinity, expect_cores, "{}", error_msg);
+        assert_eq!(affinity, expect_cores, "{error_msg}");
     }
     #[test]
     #[cfg(target_os = "linux")]

@@ -9,6 +9,7 @@ use {
         pausable::*, permanent_delegate::*, reallocate::*, scaled_ui_amount::*, token_group::*,
         token_metadata::*, transfer_fee::*, transfer_hook::*,
     },
+    serde::{Deserialize, Serialize},
     serde_json::{json, Map, Value},
     solana_account_decoder::{
         parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
@@ -16,7 +17,7 @@ use {
     solana_message::{compiled_instruction::CompiledInstruction, AccountKeys},
     solana_program_option::COption,
     solana_pubkey::Pubkey,
-    spl_token_2022::{
+    spl_token_2022_interface::{
         extension::ExtensionType,
         instruction::{AuthorityType, TokenInstruction},
     },
@@ -886,8 +887,8 @@ fn map_coption_pubkey(pubkey: COption<Pubkey>) -> Option<String> {
 #[cfg(test)]
 mod test {
     use {
-        super::*, solana_message::Message, solana_pubkey::Pubkey, spl_token_2022::instruction::*,
-        std::iter::repeat_with,
+        super::*, solana_message::Message, solana_pubkey::Pubkey,
+        spl_token_2022_interface::instruction::*, std::iter::repeat_with,
     };
 
     fn test_parse_token(program_id: &Pubkey) {
@@ -1684,7 +1685,7 @@ mod test {
         let get_account_data_size_ix = get_account_data_size(
             program_id,
             &mint_pubkey,
-            &[], // This emulates the packed data of spl_token::instruction::get_account_data_size
+            &[], // This emulates the packed data of spl_token_interface::instruction::get_account_data_size
         )
         .unwrap();
         let message = Message::new(&[get_account_data_size_ix], None);
@@ -1771,18 +1772,19 @@ mod test {
 
     #[test]
     fn test_parse_token_v3() {
-        test_parse_token(&spl_token::id());
+        test_parse_token(&spl_token_interface::id());
     }
 
     #[test]
     fn test_parse_token_2022() {
-        test_parse_token(&spl_token_2022::id());
+        test_parse_token(&spl_token_2022_interface::id());
     }
 
     #[test]
     fn test_create_native_mint() {
         let payer = Pubkey::new_unique();
-        let create_native_mint_ix = create_native_mint(&spl_token_2022::id(), &payer).unwrap();
+        let create_native_mint_ix =
+            create_native_mint(&spl_token_2022_interface::id(), &payer).unwrap();
         let message = Message::new(&[create_native_mint_ix], None);
         let compiled_instruction = &message.instructions[0];
         assert_eq!(
@@ -1795,7 +1797,7 @@ mod test {
                 instruction_type: "createNativeMint".to_string(),
                 info: json!({
                    "payer": payer.to_string(),
-                   "nativeMint": spl_token_2022::native_mint::id().to_string(),
+                   "nativeMint": spl_token_2022_interface::native_mint::id().to_string(),
                    "systemProgram": solana_sdk_ids::system_program::id().to_string(),
                 })
             }
@@ -2149,11 +2151,11 @@ mod test {
 
     #[test]
     fn test_not_enough_keys_token_v3() {
-        test_token_ix_not_enough_keys(&spl_token::id());
+        test_token_ix_not_enough_keys(&spl_token_interface::id());
     }
 
     #[test]
     fn test_not_enough_keys_token_2022() {
-        test_token_ix_not_enough_keys(&spl_token_2022::id());
+        test_token_ix_not_enough_keys(&spl_token_2022_interface::id());
     }
 }

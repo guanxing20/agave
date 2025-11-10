@@ -7,27 +7,31 @@ use {
         append_vec::{self, AppendVec},
         tiered_storage::{
             file::TieredReadableFile,
-            hot::{HotStorageReader, HotStorageWriter},
+            hot::{HotStorageReader, HotStorageWriter, RENT_EXEMPT_RENT_EPOCH},
         },
+        utils::create_account_shared_data,
     },
     solana_clock::Slot,
     solana_pubkey::Pubkey,
-    solana_rent_collector::RENT_EXEMPT_RENT_EPOCH,
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
     std::mem::ManuallyDrop,
 };
 
 mod utils;
 
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 const ACCOUNTS_COUNTS: [usize; 4] = [
     1,      // the smallest count; will bench overhead
-    100,    // number of accounts written per slot on mnb (with *no* rent rewrites)
-    1_000,  // number of accounts written slot on mnb (with rent rewrites)
+    100,    // lower range of accounts written per slot on mnb
+    1_000,  // higher range of accounts written per slot on mnb
     10_000, // reasonable largest number of accounts written per slot
 ];
 
-fn bench_write_accounts_file(c: &mut Criterion) {
-    let mut group = c.benchmark_group("write_accounts_file");
+fn bench_write_accounts_file(c: &mut Criterion, storage_access: StorageAccess) {
+    let mut group = c.benchmark_group(format!("write_accounts_file_{storage_access:?}"));
 
     // most accounts on mnb are 165-200 bytes, so use that here too
     let space = 200;
@@ -61,7 +65,7 @@ fn bench_write_accounts_file(c: &mut Criterion) {
                 || {
                     let path = temp_dir.path().join(format!("append_vec_{accounts_count}"));
                     let file_size = accounts.len() * (space + append_vec::STORE_META_OVERHEAD);
-                    AppendVec::new(path, true, file_size)
+                    AppendVec::new(path, true, file_size, storage_access)
                 },
                 |append_vec| {
                     let res = append_vec.append_accounts(&storable_accounts, 0).unwrap();
@@ -95,6 +99,18 @@ fn bench_write_accounts_file(c: &mut Criterion) {
     }
 }
 
+fn bench_write_accounts_file_file_io(c: &mut Criterion) {
+    bench_write_accounts_file(c, StorageAccess::File);
+}
+
+fn bench_write_accounts_file_mmap(c: &mut Criterion) {
+    bench_write_accounts_file(
+        c,
+        #[allow(deprecated)]
+        StorageAccess::Mmap,
+    );
+}
+
 fn bench_scan_pubkeys(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_pubkeys");
     let temp_dir = tempfile::tempdir().unwrap();
@@ -122,7 +138,7 @@ fn bench_scan_pubkeys(c: &mut Criterion) {
             .iter()
             .map(|(_, account)| append_vec::aligned_stored_size(account.data().len()))
             .sum();
-        let append_vec = AppendVec::new(append_vec_path, true, file_size);
+        let append_vec = AppendVec::new(append_vec_path, true, file_size, StorageAccess::File);
         let stored_accounts_info = append_vec
             .append_accounts(&(Slot::MAX, storable_accounts.as_slice()), 0)
             .unwrap();
@@ -133,9 +149,14 @@ fn bench_scan_pubkeys(c: &mut Criterion) {
         // these new append vecs because that would cause double-free (or triple-free here).
         // Wrap the append vecs in ManuallyDrop to *not* remove the backing file on drop.
         let append_vec_mmap = ManuallyDrop::new(
-            AppendVec::new_from_file(append_vec.path(), append_vec.len(), StorageAccess::Mmap)
-                .unwrap()
-                .0,
+            AppendVec::new_from_file(
+                append_vec.path(),
+                append_vec.len(),
+                #[allow(deprecated)]
+                StorageAccess::Mmap,
+            )
+            .unwrap()
+            .0,
         );
         let append_vec_file = ManuallyDrop::new(
             AppendVec::new_from_file(append_vec.path(), append_vec.len(), StorageAccess::File)
@@ -161,14 +182,14 @@ fn bench_scan_pubkeys(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("append_vec_mmap", accounts_count), |b| {
             b.iter(|| {
                 let mut count = 0;
-                append_vec_mmap.scan_pubkeys(|_| count += 1);
+                append_vec_mmap.scan_pubkeys(|_| count += 1).unwrap();
                 assert_eq!(count, accounts_count);
             });
         });
         group.bench_function(BenchmarkId::new("append_vec_file", accounts_count), |b| {
             b.iter(|| {
                 let mut count = 0;
-                append_vec_file.scan_pubkeys(|_| count += 1);
+                append_vec_file.scan_pubkeys(|_| count += 1).unwrap();
                 assert_eq!(count, accounts_count);
             });
         });
@@ -207,7 +228,7 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             .iter()
             .map(|(_, account)| append_vec::aligned_stored_size(account.data().len()))
             .sum();
-        let append_vec = AppendVec::new(append_vec_path, true, file_size);
+        let append_vec = AppendVec::new(append_vec_path, true, file_size, StorageAccess::File);
         let stored_accounts_info = append_vec
             .append_accounts(&(Slot::MAX, storable_accounts.as_slice()), 0)
             .unwrap();
@@ -218,9 +239,14 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
         // these new append vecs because that would cause double-free (or triple-free here).
         // Wrap the append vecs in ManuallyDrop to *not* remove the backing file on drop.
         let append_vec_mmap = ManuallyDrop::new(
-            AppendVec::new_from_file(append_vec.path(), append_vec.len(), StorageAccess::Mmap)
-                .unwrap()
-                .0,
+            AppendVec::new_from_file(
+                append_vec.path(),
+                append_vec.len(),
+                #[allow(deprecated)]
+                StorageAccess::Mmap,
+            )
+            .unwrap()
+            .0,
         );
         let append_vec_file = ManuallyDrop::new(
             AppendVec::new_from_file(append_vec.path(), append_vec.len(), StorageAccess::File)
@@ -247,7 +273,9 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             |b| {
                 b.iter_with_large_drop(|| {
                     _ = append_vec_mmap
-                        .get_stored_account_callback(0, |account| account.to_account_shared_data())
+                        .get_stored_account_callback(0, |account| {
+                            create_account_shared_data(&account)
+                        })
                         .unwrap();
                 });
             },
@@ -269,7 +297,9 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
             |b| {
                 b.iter_with_large_drop(|| {
                     _ = append_vec_file
-                        .get_stored_account_callback(0, |account| account.to_account_shared_data())
+                        .get_stored_account_callback(0, |account| {
+                            create_account_shared_data(&account)
+                        })
                         .unwrap();
                 });
             },
@@ -279,7 +309,8 @@ fn bench_get_account_shared_data(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_write_accounts_file,
+    bench_write_accounts_file_file_io,
+    bench_write_accounts_file_mmap,
     bench_scan_pubkeys,
     bench_get_account_shared_data,
 );

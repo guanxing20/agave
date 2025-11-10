@@ -5,9 +5,9 @@
 use {
     crate::banking_trace::TracedSender,
     agave_banking_stage_ingress_types::BankingPacketBatch,
+    agave_verified_packet_receiver::receiver::VerifiedPacketReceiver,
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     solana_perf::packet::PacketBatch,
-    solana_vortexor_receiver::receiver::VerifiedPacketReceiver,
     std::{
         net::UdpSocket,
         sync::{atomic::AtomicBool, Arc},
@@ -38,15 +38,13 @@ impl VortexorReceiverAdapter {
     pub fn new(
         sockets: Vec<Arc<UdpSocket>>,
         recv_timeout: Duration,
-        tpu_coalesce: Duration,
         packets_sender: TracedSender,
         forward_stage_sender: Option<Sender<(BankingPacketBatch, bool)>>,
         exit: Arc<AtomicBool>,
     ) -> Self {
         let (batch_sender, batch_receiver) = unbounded();
 
-        let receiver =
-            VerifiedPacketReceiver::new(sockets, &batch_sender, tpu_coalesce, None, exit.clone());
+        let receiver = VerifiedPacketReceiver::new(sockets, &batch_sender, None, exit.clone());
 
         let thread_hdl = Builder::new()
             .name("vtxRcvAdptr".to_string())

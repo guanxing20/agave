@@ -2,7 +2,7 @@
 
 use {
     crate::repair::{repair_service::OutstandingShredRepairs, serve_repair::ServeRepair},
-    agave_feature_set::{self as feature_set, FeatureSet},
+    agave_feature_set::FeatureSet,
     bytes::Bytes,
     crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender},
     itertools::Itertools,
@@ -13,12 +13,14 @@ use {
     solana_ledger::shred::{self, should_discard_shred, ShredFetchStats},
     solana_packet::{Meta, PACKET_DATA_SIZE},
     solana_perf::packet::{
-        PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef, PinnedPacketBatch,
-        PACKETS_PER_BATCH,
+        BytesPacket, BytesPacketBatch, PacketBatch, PacketBatchRecycler, PacketFlags, PacketRef,
     },
     solana_pubkey::Pubkey,
-    solana_runtime::bank_forks::BankForks,
-    solana_streamer::streamer::{self, PacketBatchReceiver, StreamerReceiveStats},
+    solana_runtime::bank_forks::{BankForks, SharableBanks},
+    solana_streamer::{
+        evicting_sender::EvictingSender,
+        streamer::{self, ChannelSend, PacketBatchReceiver, StreamerReceiveStats},
+    },
     std::{
         net::{SocketAddr, UdpSocket},
         sync::{
@@ -41,6 +43,14 @@ pub(crate) struct ShredFetchStage {
     thread_hdls: Vec<JoinHandle<()>>,
 }
 
+/// Ingress limit for the shred fetch channel (in terms of packet _batches_).
+///
+/// The general case sees shred and repair ingress in the hundreds of packet batches per second.
+/// However, in the case of catch-up, we may see upwards of 8k packet batches per second, which would
+/// suggest a roughly 16k packet batch limit for ample headroom. We're setting it to 4x that amount
+/// to future proof for increases of CU limits (e.g., a future 100k CU limit).
+pub(crate) const SHRED_FETCH_CHANNEL_SIZE: usize = 1024 * 64;
+
 #[derive(Clone)]
 struct RepairContext {
     repair_socket: Arc<UdpSocket>,
@@ -53,8 +63,8 @@ impl ShredFetchStage {
     fn modify_packets(
         recvr: PacketBatchReceiver,
         recvr_stats: Option<Arc<StreamerReceiveStats>>,
-        sendr: Sender<PacketBatch>,
-        bank_forks: &RwLock<BankForks>,
+        sendr: EvictingSender<PacketBatch>,
+        sharable_banks: &SharableBanks,
         shred_version: u16,
         name: &'static str,
         flags: PacketFlags,
@@ -76,14 +86,13 @@ impl ShredFetchStage {
             mut epoch_schedule,
             mut last_slot,
         ) = {
-            let bank_forks_r = bank_forks.read().unwrap();
-            let root_bank = bank_forks_r.root_bank();
+            let root_bank = sharable_banks.root();
             (
                 root_bank.slot(),
                 root_bank.get_slots_in_epoch(root_bank.epoch()),
                 root_bank.feature_set.clone(),
                 root_bank.epoch_schedule().clone(),
-                bank_forks_r.highest_slot(),
+                sharable_banks.working().slot(),
             )
         };
         let mut stats = ShredFetchStats::default();
@@ -91,11 +100,8 @@ impl ShredFetchStage {
         for mut packet_batch in recvr {
             if last_updated.elapsed().as_millis() as u64 > DEFAULT_MS_PER_SLOT {
                 last_updated = Instant::now();
-                let root_bank = {
-                    let bank_forks_r = bank_forks.read().unwrap();
-                    last_slot = bank_forks_r.highest_slot();
-                    bank_forks_r.root_bank()
-                };
+                last_slot = sharable_banks.working().slot();
+                let root_bank = sharable_banks.root();
                 feature_set = root_bank.feature_set.clone();
                 epoch_schedule = root_bank.epoch_schedule().clone();
                 last_root = root_bank.slot();
@@ -139,9 +145,17 @@ impl ShredFetchStage {
             // Filter out shreds that are way too far in the future to avoid the
             // overhead of having to hold onto them.
             let max_slot = last_slot + MAX_SHRED_DISTANCE_MINIMUM.max(2 * slots_per_epoch);
-            let drop_unchained_merkle_shreds = |shred_slot| {
+            let enforce_fixed_fec_set = |shred_slot| {
                 check_feature_activation(
-                    &feature_set::drop_unchained_merkle_shreds::id(),
+                    &agave_feature_set::enforce_fixed_fec_set::id(),
+                    shred_slot,
+                    &feature_set,
+                    &epoch_schedule,
+                )
+            };
+            let discard_unexpected_data_complete_shreds = |shred_slot| {
+                check_feature_activation(
+                    &agave_feature_set::discard_unexpected_data_complete_shreds::id(),
                     shred_slot,
                     &feature_set,
                     &epoch_schedule,
@@ -155,7 +169,8 @@ impl ShredFetchStage {
                         last_root,
                         max_slot,
                         shred_version,
-                        drop_unchained_merkle_shreds,
+                        enforce_fixed_fec_set,
+                        discard_unexpected_data_complete_shreds,
                         &mut stats,
                     )
                 {
@@ -169,8 +184,13 @@ impl ShredFetchStage {
                     stats.report();
                 }
             }
-            if sendr.send(packet_batch).is_err() {
-                break;
+            if let Err(send_err) = sendr.try_send(packet_batch) {
+                match send_err {
+                    crossbeam_channel::TrySendError::Full(v) => {
+                        stats.overflow_shreds += v.len();
+                    }
+                    _ => unreachable!("EvictingSender holds on to both ends of the channel"),
+                }
             }
         }
     }
@@ -181,7 +201,7 @@ impl ShredFetchStage {
         modifier_thread_name: &'static str,
         sockets: Vec<Arc<UdpSocket>>,
         exit: Arc<AtomicBool>,
-        sender: Sender<PacketBatch>,
+        sender: EvictingSender<PacketBatch>,
         recycler: PacketBatchRecycler,
         bank_forks: Arc<RwLock<BankForks>>,
         shred_version: u16,
@@ -191,7 +211,9 @@ impl ShredFetchStage {
         repair_context: Option<RepairContext>,
         turbine_disabled: Arc<AtomicBool>,
     ) -> (Vec<JoinHandle<()>>, JoinHandle<()>) {
-        let (packet_sender, packet_receiver) = unbounded();
+        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
+        let (packet_sender, packet_receiver) =
+            EvictingSender::new_bounded(SHRED_FETCH_CHANNEL_SIZE);
         let receiver_stats = Arc::new(StreamerReceiveStats::new(receiver_name));
         let streamers = sockets
             .into_iter()
@@ -204,10 +226,10 @@ impl ShredFetchStage {
                     packet_sender.clone(),
                     recycler.clone(),
                     receiver_stats.clone(),
-                    None,  // coalesce
-                    true,  // use_pinned_memory
-                    None,  // in_vote_only_mode
-                    false, // is_staked_service
+                    Some(Duration::from_millis(5)), // coalesce
+                    true,                           // use_pinned_memory
+                    None,                           // in_vote_only_mode
+                    false,                          // is_staked_service
                 )
             })
             .collect();
@@ -218,7 +240,7 @@ impl ShredFetchStage {
                     packet_receiver,
                     Some(receiver_stats),
                     sender,
-                    &bank_forks,
+                    &sharable_banks,
                     shred_version,
                     name,
                     flags,
@@ -236,7 +258,7 @@ impl ShredFetchStage {
         turbine_quic_endpoint_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_response_quic_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
         repair_socket: Arc<UdpSocket>,
-        sender: Sender<PacketBatch>,
+        sender: EvictingSender<PacketBatch>,
         shred_version: u16,
         bank_forks: Arc<RwLock<BankForks>>,
         cluster_info: Arc<ClusterInfo>,
@@ -290,7 +312,6 @@ impl ShredFetchStage {
         {
             let (packet_sender, packet_receiver) = unbounded();
             let bank_forks = bank_forks.clone();
-            let recycler = recycler.clone();
             let exit = exit.clone();
             let sender = sender.clone();
             let turbine_disabled = turbine_disabled.clone();
@@ -302,7 +323,6 @@ impl ShredFetchStage {
                             repair_response_quic_receiver,
                             PacketFlags::REPAIR,
                             packet_sender,
-                            recycler,
                             exit,
                         )
                     })
@@ -310,11 +330,12 @@ impl ShredFetchStage {
                 Builder::new()
                     .name("solTvuFetchRpr".to_string())
                     .spawn(move || {
+                        let sharable_banks = bank_forks.read().unwrap().sharable_banks();
                         Self::modify_packets(
                             packet_receiver,
                             None,
                             sender,
-                            &bank_forks,
+                            &sharable_banks,
                             shred_version,
                             "shred_fetch_repair_quic",
                             PacketFlags::REPAIR,
@@ -336,7 +357,6 @@ impl ShredFetchStage {
                         turbine_quic_endpoint_receiver,
                         PacketFlags::empty(),
                         packet_sender,
-                        recycler,
                         exit,
                     )
                 })
@@ -344,11 +364,12 @@ impl ShredFetchStage {
             Builder::new()
                 .name("solTvuFetchQuic".to_string())
                 .spawn(move || {
+                    let sharable_banks = bank_forks.read().unwrap().sharable_banks();
                     Self::modify_packets(
                         packet_receiver,
                         None,
                         sender,
-                        &bank_forks,
+                        &sharable_banks,
                         shred_version,
                         "shred_fetch_quic",
                         PacketFlags::empty(),
@@ -373,7 +394,7 @@ impl ShredFetchStage {
 
 impl RepairContext {
     fn keypair(&self) -> Arc<Keypair> {
-        self.cluster_info.keypair().clone()
+        self.cluster_info.keypair()
     }
 }
 
@@ -397,7 +418,6 @@ pub(crate) fn receive_quic_datagrams(
     quic_datagrams_receiver: Receiver<(Pubkey, SocketAddr, Bytes)>,
     flags: PacketFlags,
     sender: Sender<PacketBatch>,
-    recycler: PacketBatchRecycler,
     exit: Arc<AtomicBool>,
 ) {
     const RECV_TIMEOUT: Duration = Duration::from_secs(1);
@@ -408,37 +428,25 @@ pub(crate) fn receive_quic_datagrams(
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        let mut packet_batch = PinnedPacketBatch::new_with_recycler(
-            &recycler,
-            PACKETS_PER_BATCH,
-            "receive_quic_datagrams",
-        );
-        unsafe {
-            packet_batch.set_len(PACKETS_PER_BATCH);
-        };
         let deadline = Instant::now() + PACKET_COALESCE_DURATION;
         let entries = std::iter::once(entry).chain(
             std::iter::repeat_with(|| quic_datagrams_receiver.recv_deadline(deadline).ok())
                 .while_some(),
         );
-        let size = entries
+        let packet_batch: BytesPacketBatch = entries
             .filter(|(_, _, bytes)| bytes.len() <= PACKET_DATA_SIZE)
-            .zip(packet_batch.iter_mut())
-            .map(|((_pubkey, addr, bytes), packet)| {
-                *packet.meta_mut() = Meta {
+            .map(|(_pubkey, addr, bytes)| {
+                let meta = Meta {
                     size: bytes.len(),
                     addr: addr.ip(),
                     port: addr.port(),
                     flags,
                 };
-                packet.buffer_mut()[..bytes.len()].copy_from_slice(&bytes);
+                BytesPacket::new(bytes, meta)
             })
-            .count();
-        if size > 0 {
-            packet_batch.truncate(size);
-            if sender.send(packet_batch.into()).is_err() {
-                return; // The receiver end of the channel is disconnected.
-            }
+            .collect();
+        if !packet_batch.is_empty() && sender.send(packet_batch.into()).is_err() {
+            return; // The receiver end of the channel is disconnected.
         }
     }
 }

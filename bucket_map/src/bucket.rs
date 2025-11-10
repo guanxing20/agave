@@ -1,6 +1,7 @@
+#[cfg(feature = "dev-context-only-utils")]
+use crate::bucket_item::BucketItem;
 use {
     crate::{
-        bucket_item::BucketItem,
         bucket_map::BucketMapError,
         bucket_stats::BucketMapStats,
         bucket_storage::{
@@ -18,11 +19,8 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     std::{
-        collections::hash_map::DefaultHasher,
         fs,
-        hash::{Hash, Hasher},
         num::NonZeroU64,
-        ops::RangeBounds,
         path::PathBuf,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -191,10 +189,8 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
         rv
     }
 
-    pub fn items_in_range<R>(&self, range: &Option<&R>) -> Vec<BucketItem<T>>
-    where
-        R: RangeBounds<Pubkey>,
-    {
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn items(&self) -> Vec<BucketItem<T>> {
         let mut result = Vec::with_capacity(self.index.count.load(Ordering::Relaxed) as usize);
         for i in 0..self.index.capacity() {
             let ii = i % self.index.capacity();
@@ -203,14 +199,12 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
             }
             let ix = IndexEntryPlaceInBucket::new(ii);
             let key = ix.key(&self.index);
-            if range.map(|r| r.contains(key)).unwrap_or(true) {
-                let (v, ref_count) = ix.read_value(&self.index, &self.data);
-                result.push(BucketItem {
-                    pubkey: *key,
-                    ref_count,
-                    slot_list: v.to_vec(),
-                });
-            }
+            let (v, ref_count) = ix.read_value(&self.index, &self.data);
+            result.push(BucketItem {
+                pubkey: *key,
+                ref_count,
+                slot_list: v.to_vec(),
+            });
         }
         result
     }
@@ -826,14 +820,11 @@ impl<'b, T: Clone + Copy + PartialEq + std::fmt::Debug + 'static> Bucket<T> {
     }
 
     fn bucket_index_ix(key: &Pubkey, random: u64) -> u64 {
-        let mut s = DefaultHasher::new();
-        key.hash(&mut s);
-        //the locally generated random will make it hard for an attacker
-        //to deterministically cause all the pubkeys to land in the same
-        //location in any bucket on all validators
-        random.hash(&mut s);
-        s.finish()
-        //debug!(            "INDEX_IX: {:?} uid:{} loc: {} cap:{}",            key,            uid,            location,            index.capacity()        );
+        // the locally generated random will make it hard for an attacker
+        // to deterministically cause all the pubkeys to land in the same
+        // location in any bucket on all validators
+        let hasher_builder = ahash::RandomState::with_seeds(random, random, random, random);
+        hasher_builder.hash_one(key)
     }
 
     /// grow the appropriate piece. Note this takes an immutable ref.
@@ -903,8 +894,8 @@ mod tests {
         for reuse_type in 0..3 {
             let data_buckets = Vec::default();
             let v = 12u64;
-            let random = 1;
-            // with random=1, 6 entries is the most that don't collide on a single hash % cap value.
+            let random = 2;
+            // with random=2, 6 entries is the most that don't collide on a single hash % cap value.
             for len in 0..7 {
                 // cannot use pubkey [0,0,...] because that matches a zeroed out default file contents.
                 let raw = (0..len)
@@ -1535,7 +1526,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "index asked to insert the same data twice")]
     fn test_occupy_if_matches_panic() {
-        solana_logger::setup();
+        agave_logger::setup();
         let random = 1;
         let k = Pubkey::from([1u8; 32]);
         let v = 12u64;
@@ -1569,7 +1560,7 @@ mod tests {
     #[should_panic(expected = "batch insertion can only occur prior to any deletes")]
     #[test]
     fn batch_insert_after_delete() {
-        solana_logger::setup();
+        agave_logger::setup();
 
         let tmpdir = tempdir().unwrap();
         let paths: Vec<PathBuf> = vec![tmpdir.path().to_path_buf()];
@@ -1590,5 +1581,19 @@ mod tests {
         bucket.delete_key(&key);
 
         bucket.batch_insert_non_duplicates(&[]);
+    }
+
+    /// Ensure bucket_index_ix() produces stable results
+    #[test]
+    fn test_bucket_index_ix_is_stable() {
+        const PUBKEY: Pubkey = Pubkey::new_from_array([0xC3; 32]);
+        const RANDOM1: u64 = 0x18E7_9D0B_94D8_E428;
+        const RANDOM2: u64 = 0x60AE_DA87_48E9_A887;
+
+        let ix1 = Bucket::<()>::bucket_index_ix(&PUBKEY, RANDOM1);
+        assert_eq!(ix1, 0x0CAD_75DB_E472_9589);
+
+        let ix2 = Bucket::<()>::bucket_index_ix(&PUBKEY, RANDOM2);
+        assert_ne!(ix2, ix1);
     }
 }

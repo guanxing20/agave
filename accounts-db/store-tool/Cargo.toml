@@ -8,6 +8,13 @@ repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
+workspace = "../../dev-bins"
+
+[features]
+agave-unstable-api = []
+dev-context-only-utils = []
+dummy-for-ci-check = []
+frozen-abi = []
 
 [dependencies]
 ahash = { workspace = true }
@@ -18,6 +25,3 @@ solana-accounts-db = { workspace = true, features = ["dev-context-only-utils"] }
 solana-pubkey = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-version = { workspace = true }
-
-[features]
-dev-context-only-utils = []

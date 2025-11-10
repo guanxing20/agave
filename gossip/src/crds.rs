@@ -27,6 +27,7 @@
 
 use {
     crate::{
+        cluster_info_metrics::{last_four_chars, should_report_message_signature},
         contact_info::ContactInfo,
         crds_data::CrdsData,
         crds_entry::CrdsEntry,
@@ -44,7 +45,6 @@ use {
     solana_clock::Slot,
     solana_hash::Hash,
     solana_pubkey::Pubkey,
-    solana_signature::Signature,
     std::{
         cmp::Ordering,
         collections::{hash_map, BTreeMap, HashMap, VecDeque},
@@ -57,12 +57,11 @@ const CRDS_SHARDS_BITS: u32 = 12;
 // Number of vote slots to track in an lru-cache for metrics.
 const VOTE_SLOTS_METRICS_CAP: usize = 100;
 // Required number of leading zero bits for crds signature to get reported to influx
-// mean new push messages received per minute per node
-//      testnet: ~500k,
-//      mainnet: ~280k
+// mean new CrdsValues received per minute per node
+//      testnet/mainnet: ~680k as of 2025-06-06
 // target: 1 signature reported per minute
-// log2(500k) = ~18.9.
-const SIGNATURE_SAMPLE_LEADING_ZEROS: u32 = 19;
+// log2(680k) = ~19.375.
+pub(crate) const SIGNATURE_SAMPLE_LEADING_ZEROS: u32 = 19;
 
 pub struct Crds {
     /// Stores the map of labels and values
@@ -190,25 +189,15 @@ impl Default for Crds {
 // Both values should have the same key/label.
 fn overrides(value: &CrdsValue, other: &VersionedCrdsValue) -> bool {
     assert_eq!(value.label(), other.value.label(), "labels mismatch!");
-    // Contact-infos and node instances are special cased so that if there are
+    // Contact-infos are special cased so that if there are
     // two running instances of the same node, the more recent start is
     // propagated through gossip regardless of wallclocks.
-    match value.data() {
-        CrdsData::ContactInfo(value) => {
-            if let CrdsData::ContactInfo(other) = other.value.data() {
-                if let Some(out) = value.overrides(other) {
-                    return out;
-                }
+    if let CrdsData::ContactInfo(value) = value.data() {
+        if let CrdsData::ContactInfo(other) = other.value.data() {
+            if let Some(out) = value.overrides(other) {
+                return out;
             }
         }
-        CrdsData::NodeInstance(value) => {
-            if let CrdsData::NodeInstance(other) = other.value.data() {
-                if let Some(out) = value.overrides(other) {
-                    return out;
-                }
-            }
-        }
-        _ => (),
     }
     match value.wallclock().cmp(&other.value.wallclock()) {
         Ordering::Less => false,
@@ -492,15 +481,20 @@ impl Crds {
         // used when purging old values. If the origin does not exist in the
         // table, fallback to exhaustive update on all associated records.
         let origin = CrdsValueLabel::ContactInfo(*pubkey);
-        if let Some(origin) = self.table.get_mut(&origin) {
-            if origin.local_timestamp < now {
-                origin.local_timestamp = now;
+        match self.table.get_mut(&origin) {
+            Some(origin) => {
+                if origin.local_timestamp < now {
+                    origin.local_timestamp = now;
+                }
             }
-        } else if let Some(indices) = self.records.get(pubkey) {
-            for index in indices {
-                let entry = self.table.index_mut(*index);
-                if entry.local_timestamp < now {
-                    entry.local_timestamp = now;
+            None => {
+                if let Some(indices) = self.records.get(pubkey) {
+                    for index in indices {
+                        let entry = self.table.index_mut(*index);
+                        if entry.local_timestamp < now {
+                            entry.local_timestamp = now;
+                        }
+                    }
                 }
             }
         }
@@ -712,22 +706,23 @@ impl CrdsDataStats {
             return;
         };
 
-        if should_report_message_signature(entry.value.signature()) {
+        if should_report_message_signature(entry.value.signature(), SIGNATURE_SAMPLE_LEADING_ZEROS)
+        {
             datapoint_info!(
                 "gossip_crds_sample",
                 (
                     "origin",
-                    entry.value.pubkey().to_string().get(..8),
+                    last_four_chars(&entry.value.pubkey().to_string()),
                     Option<String>
                 ),
                 (
                     "signature",
-                    entry.value.signature().to_string().get(..8),
+                    last_four_chars(&entry.value.signature().to_string()),
                     Option<String>
                 ),
                 (
                     "from",
-                    from.to_string().get(..8),
+                    last_four_chars(&from.to_string()),
                     Option<String>
                 )
             );
@@ -779,22 +774,12 @@ impl CrdsStats {
     }
 }
 
-/// check if first SIGNATURE_SAMPLE_LEADING_ZEROS bits of signature are 0
-#[inline]
-fn should_report_message_signature(signature: &Signature) -> bool {
-    let Some(Ok(bytes)) = signature.as_ref().get(..8).map(<[u8; 8]>::try_from) else {
-        return false;
-    };
-    u64::from_le_bytes(bytes).trailing_zeros() >= SIGNATURE_SAMPLE_LEADING_ZEROS
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::crds_data::{new_rand_timestamp, AccountsHashes, NodeInstance},
-        rand::{thread_rng, Rng, SeedableRng},
-        rand_chacha::ChaChaRng,
+        crate::crds_data::{new_rand_timestamp, AccountsHashes},
+        rand::{thread_rng, Rng},
         rayon::ThreadPoolBuilder,
         solana_keypair::Keypair,
         solana_signer::Signer,
@@ -886,61 +871,6 @@ mod tests {
         crds.update_record_timestamp(&val2.label().pubkey(), 1);
         assert_eq!(crds.table[&val2.label()].local_timestamp, 2);
         assert_eq!(crds.table[&val2.label()].ordinal, 1);
-    }
-
-    #[test]
-    fn test_upsert_node_instance() {
-        const SEED: [u8; 32] = [0x42; 32];
-        let mut rng = ChaChaRng::from_seed(SEED);
-        fn make_crds_value(node: NodeInstance) -> CrdsValue {
-            CrdsValue::new_unsigned(CrdsData::NodeInstance(node))
-        }
-        let now = 1_620_838_767_000;
-        let mut crds = Crds::default();
-        let pubkey = Pubkey::new_unique();
-        let node = NodeInstance::new(&mut rng, pubkey, now);
-        let node = make_crds_value(node);
-        assert_eq!(crds.insert(node, now, GossipRoute::LocalMessage), Ok(()));
-        // A node-instance with a different key should insert fine even with
-        // older timestamps.
-        let other = NodeInstance::new(&mut rng, Pubkey::new_unique(), now - 1);
-        let other = make_crds_value(other);
-        assert_eq!(crds.insert(other, now, GossipRoute::LocalMessage), Ok(()));
-        // A node-instance with older timestamp should fail to insert, even if
-        // the wallclock is more recent.
-        let other = NodeInstance::new(&mut rng, pubkey, now - 1);
-        let other = other.with_wallclock(now + 1);
-        let other = make_crds_value(other);
-        let value_hash = *other.hash();
-        assert_eq!(
-            crds.insert(other, now, GossipRoute::LocalMessage),
-            Err(CrdsError::InsertFailed)
-        );
-        assert_eq!(*crds.purged.back().unwrap(), (value_hash, now));
-        // A node instance with the same timestamp should insert only if the
-        // random token is larger.
-        let mut num_overrides = 0;
-        for _ in 0..100 {
-            let other = NodeInstance::new(&mut rng, pubkey, now);
-            let other = make_crds_value(other);
-            let value_hash = *other.hash();
-            match crds.insert(other, now, GossipRoute::LocalMessage) {
-                Ok(()) => num_overrides += 1,
-                Err(CrdsError::InsertFailed) => {
-                    assert_eq!(*crds.purged.back().unwrap(), (value_hash, now))
-                }
-                _ => panic!(),
-            }
-        }
-        assert_eq!(num_overrides, 5);
-        // A node instance with larger timestamp should insert regardless of
-        // its token value.
-        for k in 1..10 {
-            let other = NodeInstance::new(&mut rng, pubkey, now + k);
-            let other = other.with_wallclock(now - 1);
-            let other = make_crds_value(other);
-            assert_matches!(crds.insert(other, now, GossipRoute::LocalMessage), Ok(()));
-        }
     }
 
     #[test]

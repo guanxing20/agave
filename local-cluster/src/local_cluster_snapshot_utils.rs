@@ -1,12 +1,12 @@
 use {
     crate::local_cluster::LocalCluster,
-    log::*,
-    solana_runtime::{
+    agave_snapshots::{
+        paths as snapshot_paths,
         snapshot_archive_info::{
             FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfoGetter,
         },
-        snapshot_utils,
     },
+    log::*,
     std::{
         path::Path,
         thread::sleep,
@@ -70,12 +70,12 @@ impl LocalCluster {
         max_wait_duration: Option<Duration>,
     ) -> NextSnapshotResult {
         let full_snapshot_slot =
-            snapshot_utils::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir);
+            snapshot_paths::get_highest_full_snapshot_archive_slot(&full_snapshot_archives_dir);
         let last_slot = match next_snapshot_type {
             NextSnapshotType::FullSnapshot => full_snapshot_slot,
             NextSnapshotType::IncrementalAndFullSnapshot => {
                 full_snapshot_slot.and_then(|full_snapshot_slot| {
-                    snapshot_utils::get_highest_incremental_snapshot_archive_slot(
+                    snapshot_paths::get_highest_incremental_snapshot_archive_slot(
                         incremental_snapshot_archives_dir.as_ref().unwrap(),
                         full_snapshot_slot,
                     )
@@ -86,15 +86,13 @@ impl LocalCluster {
 
         // Wait for a snapshot for a bank > last_slot to be made
         trace!(
-            "Waiting for {:?} snapshot archive to be generated with slot > {}, max wait duration: {:?}",
-            next_snapshot_type,
-            last_slot,
-            max_wait_duration,
+            "Waiting for {next_snapshot_type:?} snapshot archive to be generated with slot > \
+             {last_slot}, max wait duration: {max_wait_duration:?}",
         );
         let timer = Instant::now();
         let next_snapshot = loop {
             if let Some(full_snapshot_archive_info) =
-                snapshot_utils::get_highest_full_snapshot_archive_info(&full_snapshot_archives_dir)
+                snapshot_paths::get_highest_full_snapshot_archive_info(&full_snapshot_archives_dir)
             {
                 match next_snapshot_type {
                     NextSnapshotType::FullSnapshot => {
@@ -104,7 +102,7 @@ impl LocalCluster {
                     }
                     NextSnapshotType::IncrementalAndFullSnapshot => {
                         if let Some(incremental_snapshot_archive_info) =
-                            snapshot_utils::get_highest_incremental_snapshot_archive_info(
+                            snapshot_paths::get_highest_incremental_snapshot_archive_info(
                                 incremental_snapshot_archives_dir.as_ref().unwrap(),
                                 full_snapshot_archive_info.slot(),
                             )
@@ -122,7 +120,8 @@ impl LocalCluster {
             if let Some(max_wait_duration) = max_wait_duration {
                 assert!(
                     timer.elapsed() < max_wait_duration,
-                    "Waiting for next {next_snapshot_type:?} snapshot exceeded the {max_wait_duration:?} maximum wait duration!",
+                    "Waiting for next {next_snapshot_type:?} snapshot exceeded the \
+                     {max_wait_duration:?} maximum wait duration!",
                 );
             }
             sleep(Duration::from_secs(1));

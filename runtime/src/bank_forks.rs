@@ -2,7 +2,6 @@
 
 use {
     crate::{
-        accounts_background_service::SnapshotRequest,
         bank::{bank_hash_details, Bank, SquashTiming},
         bank_hash_cache::DumpedSlotSubscription,
         installed_scheduler_pool::{
@@ -10,7 +9,7 @@ use {
         },
         snapshot_controller::SnapshotController,
     },
-    crossbeam_channel::SendError,
+    arc_swap::ArcSwap,
     log::*,
     solana_clock::{BankId, Slot},
     solana_hash::Hash,
@@ -26,7 +25,6 @@ use {
         },
         time::Instant,
     },
-    thiserror::Error,
 };
 
 pub const MAX_ROOT_DISTANCE_FOR_VOTE_ONLY: Slot = 400;
@@ -45,10 +43,33 @@ impl ReadOnlyAtomicSlot {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum SetRootError {
-    #[error("failed to send epoch accounts hash request for bank {0}: {1}")]
-    SendEpochAccountHashError(Slot, SendError<SnapshotRequest>),
+/// Convenience type since often root/working banks are fetched together.
+#[derive(Clone)]
+pub struct SharableBanks {
+    root_bank: Arc<ArcSwap<Bank>>,
+    working_bank: Arc<ArcSwap<Bank>>,
+}
+
+impl SharableBanks {
+    pub fn root(&self) -> Arc<Bank> {
+        self.root_bank.load_full()
+    }
+
+    pub fn working(&self) -> Arc<Bank> {
+        self.working_bank.load_full()
+    }
+
+    pub fn load(&self) -> BankPair {
+        BankPair {
+            root_bank: self.root(),
+            working_bank: self.working(),
+        }
+    }
+}
+
+pub struct BankPair {
+    pub root_bank: Arc<Bank>,
+    pub working_bank: Arc<Bank>,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -74,6 +95,8 @@ pub struct BankForks {
     banks: HashMap<Slot, BankWithScheduler>,
     descendants: HashMap<Slot, HashSet<Slot>>,
     root: Arc<AtomicSlot>,
+    working_slot: Slot,
+    sharable_banks: SharableBanks,
     in_vote_only_mode: Arc<AtomicBool>,
     highest_slot_at_startup: Slot,
     scheduler_pool: Option<InstalledSchedulerPoolArc>,
@@ -120,6 +143,13 @@ impl BankForks {
 
         let bank_forks = Arc::new(RwLock::new(Self {
             root: Arc::new(AtomicSlot::new(root_slot)),
+            working_slot: root_slot,
+            sharable_banks: SharableBanks {
+                root_bank: Arc::new(ArcSwap::from(root_bank.clone())),
+                // working bank is initially the same as root - all banks are either the root
+                // or its ancestors.
+                working_bank: Arc::new(ArcSwap::from(root_bank.clone())),
+            },
             banks,
             descendants,
             in_vote_only_mode: Arc::new(AtomicBool::new(false)),
@@ -204,12 +234,16 @@ impl BankForks {
         self.get(slot).map(|bank| bank.hash())
     }
 
+    pub fn sharable_banks(&self) -> SharableBanks {
+        self.sharable_banks.clone()
+    }
+
     pub fn root_bank(&self) -> Arc<Bank> {
-        self[self.root()].clone()
+        self.sharable_banks.root()
     }
 
     pub fn install_scheduler_pool(&mut self, pool: InstalledSchedulerPoolArc) {
-        info!("Installed new scheduler_pool into bank_forks: {:?}", pool);
+        info!("Installed new scheduler_pool into bank_forks: {pool:?}");
         assert!(
             self.scheduler_pool.replace(pool).is_none(),
             "Reinstalling scheduler pool isn't supported"
@@ -242,6 +276,11 @@ impl BankForks {
         for parent in bank.proper_ancestors() {
             self.descendants.entry(parent).or_default().insert(slot);
         }
+
+        // Update sharable working bank and cached slot.
+        self.working_slot = self.find_highest_slot();
+        self.sharable_banks.working_bank.store(self.working_bank());
+
         bank
     }
 
@@ -285,15 +324,25 @@ impl BankForks {
         if entry.get().is_empty() {
             entry.remove_entry();
         }
+
+        // Update sharable working bank and cached slot.
+        // The previous working bank (highest slot) may have been removed.
+        self.working_slot = self.find_highest_slot();
+        self.sharable_banks.working_bank.store(self.working_bank());
+
         Some(bank)
     }
 
     pub fn highest_slot(&self) -> Slot {
+        self.working_slot
+    }
+
+    fn find_highest_slot(&self) -> Slot {
         self.banks.values().map(|bank| bank.slot()).max().unwrap()
     }
 
     pub fn working_bank(&self) -> Arc<Bank> {
-        self[self.highest_slot()].clone()
+        self.banks[&self.highest_slot()].clone_without_scheduler()
     }
 
     pub fn working_bank_with_scheduler(&self) -> BankWithScheduler {
@@ -340,16 +389,19 @@ impl BankForks {
         root: Slot,
         snapshot_controller: Option<&SnapshotController>,
         highest_super_majority_root: Option<Slot>,
-    ) -> Result<(Vec<BankWithScheduler>, SetRootMetrics), SetRootError> {
-        let old_epoch = self.root_bank().epoch();
-        // To support `RootBankCache` (via `ReadOnlyAtomicSlot`) accessing `root` *without* locking
-        // BankForks first *and* from a different thread, this store *must* be at least Release to
-        // ensure atomic ordering correctness.
-        self.root.store(root, Ordering::Release);
+    ) -> (Vec<BankWithScheduler>, SetRootMetrics) {
+        let old_epoch = self.sharable_banks.root().epoch();
 
         let root_bank = &self
             .get(root)
             .expect("root bank didn't exist in bank_forks");
+
+        // To support `RootBankCache` (via `ReadOnlyAtomicSlot`) accessing `root` *without* locking
+        // BankForks first *and* from a different thread, this store *must* be at least Release to
+        // ensure atomic ordering correctness.
+        self.root.store(root, Ordering::Release);
+        self.sharable_banks.root_bank.store(Arc::clone(root_bank));
+
         let new_epoch = root_bank.epoch();
         if old_epoch != new_epoch {
             info!(
@@ -362,6 +414,13 @@ impl BankForks {
                     .unwrap()
                     .node_id_to_vote_accounts()
             );
+            // Now we have rooted a bank in a new epoch, there are no needs to
+            // keep the epoch rewards cache for current epoch any longer.
+            info!(
+                "Clearing epoch rewards cache for epoch {old_epoch} after setting root to slot \
+                 {root}"
+            );
+            root_bank.clear_epoch_rewards_cache();
         }
         let root_tx_count = root_bank
             .parents()
@@ -375,7 +434,7 @@ impl BankForks {
         let total_parent_banks = banks.len();
         let (is_root_bank_squashed, mut squash_timing, total_snapshot_ms) =
             if let Some(snapshot_controller) = snapshot_controller {
-                snapshot_controller.handle_new_roots(root, &banks)?
+                snapshot_controller.handle_new_roots(root, &banks)
             } else {
                 (false, SquashTiming::default(), 0)
             };
@@ -395,7 +454,7 @@ impl BankForks {
         drop(parents);
         drop_parent_banks_time.stop();
 
-        Ok((
+        (
             removed_banks,
             SetRootMetrics {
                 timings: SetRootTimings {
@@ -411,7 +470,7 @@ impl BankForks {
                 dropped_banks_len: dropped_banks_len as i64,
                 accounts_data_len,
             },
-        ))
+        )
     }
 
     pub fn prune_program_cache(&self, root: Slot) {
@@ -425,14 +484,11 @@ impl BankForks {
         root: Slot,
         snapshot_controller: Option<&SnapshotController>,
         highest_super_majority_root: Option<Slot>,
-    ) -> Result<Vec<BankWithScheduler>, SetRootError> {
+    ) -> Vec<BankWithScheduler> {
         let program_cache_prune_start = Instant::now();
         let set_root_start = Instant::now();
-        let (removed_banks, set_root_metrics) = self.do_set_root_return_metrics(
-            root,
-            snapshot_controller,
-            highest_super_majority_root,
-        )?;
+        let (removed_banks, set_root_metrics) =
+            self.do_set_root_return_metrics(root, snapshot_controller, highest_super_majority_root);
         datapoint_info!(
             "bank-forks_set_root",
             (
@@ -477,14 +533,6 @@ impl BankForks {
                 i64
             ),
             (
-                "total_squash_accounts_store_ms",
-                set_root_metrics
-                    .timings
-                    .total_squash_time
-                    .squash_accounts_store_ms,
-                i64
-            ),
-            (
                 "total_snapshot_ms",
                 set_root_metrics.timings.total_snapshot_ms,
                 i64
@@ -518,7 +566,7 @@ impl BankForks {
             ("dropped_banks_len", set_root_metrics.dropped_banks_len, i64),
             ("accounts_data_len", set_root_metrics.accounts_data_len, i64),
         );
-        Ok(removed_banks)
+        removed_banks
     }
 
     pub fn root(&self) -> Slot {
@@ -648,36 +696,58 @@ impl ForkGraph for BankForks {
     }
 }
 
+impl Drop for BankForks {
+    fn drop(&mut self) {
+        info!("BankForks::drop(): started...");
+        self.banks.clear();
+
+        if let Some(scheduler_pool) = self.scheduler_pool.take() {
+            scheduler_pool.uninstalled_from_bank_forks();
+        }
+        info!("BankForks::drop(): ...finished");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
         super::*,
         crate::{
-            accounts_background_service::SnapshotRequestKind,
             bank::test_utils::update_vote_account_timestamp,
             genesis_utils::{
                 create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
             },
-            snapshot_config::SnapshotConfig,
         },
         assert_matches::assert_matches,
-        solana_accounts_db::epoch_accounts_hash::EpochAccountsHash,
         solana_clock::UnixTimestamp,
         solana_epoch_schedule::EpochSchedule,
-        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
         solana_signer::Signer,
         solana_vote_program::vote_state::BlockTimestamp,
-        std::{sync::atomic::Ordering::Relaxed, time::Duration},
     };
 
+    // This test verifies that BankForks::new_rw_arc() doesn't create a reference cycle.
+    //
+    // Before PR #1893, there was a cycle:
+    //   Arc<RwLock<BankForks>> → Bank → ProgramCache → Arc<RwLock<BankForks>>
+    //
+    // This happened because new_rw_arc() called:
+    //   root_bank.set_fork_graph_in_program_cache(bank_forks.clone())
+    //
+    // The fix changed it to use a Weak reference:
+    //   root_bank.set_fork_graph_in_program_cache(Arc::downgrade(&bank_forks))
+    //
+    // Breaking the cycle:
+    //   Arc<RwLock<BankForks>> → Bank → ProgramCache → Weak<RwLock<BankForks>>
+    //
+    // Without the fix: strong_count == 2 (the clone creates an extra strong ref)
+    // With the fix: strong_count == 1 (only the returned Arc holds a strong ref)
     #[test]
     fn test_bank_forks_new_rw_arc_memory_leak() {
-        for _ in 0..1000 {
-            let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
-            BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
-        }
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        assert_eq!(Arc::strong_count(&bank_forks), 1);
     }
 
     #[test]
@@ -762,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_bank_forks_different_set_root() {
-        solana_logger::setup();
+        agave_logger::setup();
         let leader_keypair = Keypair::new();
         let GenesisConfigInfo {
             mut genesis_config,
@@ -772,48 +842,10 @@ mod tests {
         let slots_in_epoch = 32;
         genesis_config.epoch_schedule = EpochSchedule::new(slots_in_epoch);
 
-        // Spin up a thread to be a fake Accounts Background Service.  Need to intercept and handle
-        // all EpochAccountsHash requests so future rooted banks do not hang in Bank::freeze()
-        // waiting for an in-flight EAH calculation to complete.
-        let (snapshot_request_sender, snapshot_request_receiver) = crossbeam_channel::unbounded();
-        let snapshot_controller = SnapshotController::new(
-            snapshot_request_sender,
-            SnapshotConfig::new_disabled(),
-            0, /* root_slot */
-        );
-        let bg_exit = Arc::new(AtomicBool::new(false));
-        let bg_thread = {
-            let exit = Arc::clone(&bg_exit);
-            std::thread::spawn(move || {
-                while !exit.load(Relaxed) {
-                    snapshot_request_receiver
-                        .try_iter()
-                        .filter(|snapshot_request| {
-                            snapshot_request.request_kind == SnapshotRequestKind::EpochAccountsHash
-                        })
-                        .for_each(|snapshot_request| {
-                            snapshot_request
-                                .snapshot_root_bank
-                                .rc
-                                .accounts
-                                .accounts_db
-                                .epoch_accounts_hash_manager
-                                .set_valid(
-                                    EpochAccountsHash::new(Hash::new_unique()),
-                                    snapshot_request.snapshot_root_bank.slot(),
-                                )
-                        });
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            })
-        };
-
         let bank0 = Bank::new_for_tests(&genesis_config);
         let bank_forks0 = BankForks::new_rw_arc(bank0);
         let mut bank_forks0 = bank_forks0.write().unwrap();
-        bank_forks0
-            .set_root(0, Some(&snapshot_controller), None)
-            .unwrap();
+        bank_forks0.set_root(0, None, None);
 
         let bank1 = Bank::new_for_tests(&genesis_config);
         let bank_forks1 = BankForks::new_rw_arc(bank1);
@@ -848,9 +880,7 @@ mod tests {
 
             // Set root in bank_forks0 to truncate the ancestor history
             bank_forks0.insert(child1);
-            bank_forks0
-                .set_root(slot, Some(&snapshot_controller), None)
-                .unwrap();
+            bank_forks0.set_root(slot, None, None);
 
             // Don't set root in bank_forks1 to keep the ancestor history
             bank_forks1.insert(child2);
@@ -864,9 +894,6 @@ mod tests {
         info!("child0.ancestors: {:?}", child1.ancestors);
         info!("child1.ancestors: {:?}", child2.ancestors);
         assert_eq!(child1.hash(), child2.hash());
-
-        bg_exit.store(true, Relaxed);
-        bg_thread.join().unwrap();
     }
 
     fn make_hash_map(data: Vec<(Slot, Vec<Slot>)>) -> HashMap<Slot, HashSet<Slot>> {
@@ -915,15 +942,11 @@ mod tests {
                 (4, vec![]),
             ])
         );
-        bank_forks
-            .write()
-            .unwrap()
-            .set_root(
-                2,    // root
-                None, // snapshot_controller
-                None, // highest confirmed root
-            )
-            .unwrap();
+        bank_forks.write().unwrap().set_root(
+            2,    // root
+            None, // snapshot_controller
+            None, // highest confirmed root
+        );
         bank_forks.read().unwrap().get(2).unwrap().squash();
         assert_eq!(
             bank_forks.read().unwrap().ancestors(),
@@ -982,15 +1005,11 @@ mod tests {
                 (4, vec![]),
             ])
         );
-        bank_forks
-            .write()
-            .unwrap()
-            .set_root(
-                2,
-                None,    // snapshot_controller
-                Some(1), // highest confirmed root
-            )
-            .unwrap();
+        bank_forks.write().unwrap().set_root(
+            2,
+            None,    // snapshot_controller
+            Some(1), // highest confirmed root
+        );
         bank_forks.read().unwrap().get(2).unwrap().squash();
         assert_eq!(
             bank_forks.read().unwrap().ancestors(),
@@ -1076,13 +1095,11 @@ mod tests {
 
         assert_matches!(bank_forks.relationship(1, 13), BlockRelation::Unknown);
         assert_matches!(bank_forks.relationship(13, 2), BlockRelation::Unknown);
-        bank_forks
-            .set_root(
-                2,
-                None,    // snapshot_controller
-                Some(1), // highest confirmed root
-            )
-            .unwrap();
+        bank_forks.set_root(
+            2,
+            None,    // snapshot_controller
+            Some(1), // highest confirmed root
+        );
         assert_matches!(bank_forks.relationship(1, 2), BlockRelation::Unknown);
         assert_matches!(bank_forks.relationship(2, 0), BlockRelation::Unknown);
     }

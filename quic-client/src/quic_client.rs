@@ -47,7 +47,7 @@ impl AsyncTaskSemaphore {
     /// When returned, the lock has been locked and usage count has been
     /// incremented. When the returned MutexGuard is dropped the lock is dropped
     /// without decrementing the usage count.
-    pub fn acquire(&self) -> MutexGuard<u64> {
+    pub fn acquire(&self) -> MutexGuard<'_, u64> {
         let mut count = self.counter.lock().unwrap();
         *count += 1;
         while *count > self.permits {
@@ -80,7 +80,7 @@ pub fn get_runtime() -> &'static Runtime {
 
 async fn send_data_async(
     connection: Arc<NonblockingQuicConnection>,
-    buffer: Vec<u8>,
+    buffer: Arc<Vec<u8>>,
 ) -> TransportResult<()> {
     let result = timeout(SEND_DATA_TIMEOUT, connection.send_data(&buffer)).await;
     ASYNC_TASK_SEMAPHORE.release();
@@ -160,7 +160,7 @@ impl ClientConnection for QuicClientConnection {
         Ok(())
     }
 
-    fn send_data_async(&self, data: Vec<u8>) -> TransportResult<()> {
+    fn send_data_async(&self, data: Arc<Vec<u8>>) -> TransportResult<()> {
         let _lock = ASYNC_TASK_SEMAPHORE.acquire();
         let inner = self.inner.clone();
 
@@ -179,4 +179,10 @@ impl ClientConnection for QuicClientConnection {
         RUNTIME.block_on(self.inner.send_data(buffer))?;
         Ok(())
     }
+}
+
+pub(crate) fn close_quic_connection(connection: Arc<QuicClient>) {
+    // Close the connection and release resources
+    trace!("Closing QUIC connection to {}", connection.server_addr());
+    RUNTIME.block_on(connection.close());
 }

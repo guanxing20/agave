@@ -3,13 +3,14 @@
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::{Entry as BlockhashesEntry, RecentBlockhashes};
 use {
-    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
-    solana_bpf_loader_program::syscalls::{
-        SyscallAbort, SyscallGetClockSysvar, SyscallGetRentSysvar, SyscallInvokeSignedRust,
-        SyscallLog, SyscallMemcmp, SyscallMemcpy, SyscallMemmove, SyscallMemset,
-        SyscallSetReturnData,
+    agave_syscalls::{
+        SyscallAbort, SyscallGetClockSysvar, SyscallGetEpochScheduleSysvar, SyscallGetRentSysvar,
+        SyscallInvokeSignedRust, SyscallLog, SyscallMemcmp, SyscallMemcpy, SyscallMemmove,
+        SyscallMemset, SyscallSetReturnData,
     },
+    solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_clock::{Clock, Slot, UnixTimestamp},
+    solana_epoch_schedule::EpochSchedule,
     solana_fee_structure::{FeeDetails, FeeStructure},
     solana_loader_v3_interface::{self as bpf_loader_upgradeable, state::UpgradeableLoaderState},
     solana_program_runtime::{
@@ -28,8 +29,8 @@ use {
     solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMMessage,
+    solana_svm_type_overrides::sync::{Arc, RwLock},
     solana_sysvar_id::SysvarId,
-    solana_type_overrides::sync::{Arc, RwLock},
     std::{
         cmp::Ordering,
         collections::HashMap,
@@ -67,39 +68,12 @@ pub struct MockBankCallback {
 impl InvokeContextCallback for MockBankCallback {}
 
 impl TransactionProcessingCallback for MockBankCallback {
-    fn account_matches_owners(&self, account: &Pubkey, owners: &[Pubkey]) -> Option<usize> {
-        if let Some(data) = self.account_shared_data.read().unwrap().get(account) {
-            if data.lamports() == 0 {
-                None
-            } else {
-                owners.iter().position(|entry| data.owner() == entry)
-            }
-        } else {
-            None
-        }
-    }
-
-    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
+    fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, Slot)> {
         self.account_shared_data
             .read()
             .unwrap()
             .get(pubkey)
-            .cloned()
-    }
-
-    fn add_builtin_account(&self, name: &str, program_id: &Pubkey) {
-        let account_data = AccountSharedData::from(Account {
-            lamports: 5000,
-            data: name.as_bytes().to_vec(),
-            owner: solana_sdk_ids::native_loader::id(),
-            executable: true,
-            rent_epoch: 0,
-        });
-
-        self.account_shared_data
-            .write()
-            .unwrap()
-            .insert(*program_id, account_data);
+            .map(|account| (account.clone(), 0))
     }
 
     fn inspect_account(&self, address: &Pubkey, account_state: AccountState, is_writable: bool) {
@@ -128,6 +102,29 @@ impl MockBankCallback {
             signature_count.saturating_mul(FeeStructure::default().lamports_per_signature),
             prioritization_fee,
         )
+    }
+
+    pub fn add_builtin(
+        &self,
+        batch_processor: &TransactionBatchProcessor<MockForkGraph>,
+        program_id: Pubkey,
+        name: &str,
+        builtin: ProgramCacheEntry,
+    ) {
+        let account_data = AccountSharedData::from(Account {
+            lamports: 5000,
+            data: name.as_bytes().to_vec(),
+            owner: solana_sdk_ids::native_loader::id(),
+            executable: true,
+            rent_epoch: 0,
+        });
+
+        self.account_shared_data
+            .write()
+            .unwrap()
+            .insert(program_id, account_data);
+
+        batch_processor.add_builtin(program_id, builtin);
     }
 
     #[allow(unused)]
@@ -176,10 +173,20 @@ impl MockBankCallback {
             .write()
             .unwrap()
             .insert(RecentBlockhashes::id(), account_data);
+
+        // EpochSchedule is required for non-mocked LoaderV3 deploy
+        let epoch_schedule = EpochSchedule::without_warmup();
+
+        let mut account_data = AccountSharedData::default();
+        account_data.set_data(bincode::serialize(&epoch_schedule).unwrap());
+        self.account_shared_data
+            .write()
+            .unwrap()
+            .insert(EpochSchedule::id(), account_data);
     }
 }
 
-fn load_program(name: String) -> Vec<u8> {
+pub fn load_program(name: String) -> Vec<u8> {
     // Loading the program file
     let mut dir = env::current_dir().unwrap();
     dir.push("tests");
@@ -269,8 +276,8 @@ pub fn register_builtins(
     const DEPLOYMENT_SLOT: u64 = 0;
     // We must register LoaderV3 as a loadable account, otherwise programs won't execute.
     let loader_v3_name = "solana_bpf_loader_upgradeable_program";
-    batch_processor.add_builtin(
-        mock_bank,
+    mock_bank.add_builtin(
+        batch_processor,
         solana_sdk_ids::bpf_loader_upgradeable::id(),
         loader_v3_name,
         ProgramCacheEntry::new_builtin(
@@ -282,8 +289,8 @@ pub fn register_builtins(
 
     // Other loaders are needed for testing program cache behavior.
     let loader_v1_name = "solana_bpf_loader_deprecated_program";
-    batch_processor.add_builtin(
-        mock_bank,
+    mock_bank.add_builtin(
+        batch_processor,
         bpf_loader_deprecated::id(),
         loader_v1_name,
         ProgramCacheEntry::new_builtin(
@@ -294,8 +301,8 @@ pub fn register_builtins(
     );
 
     let loader_v2_name = "solana_bpf_loader_program";
-    batch_processor.add_builtin(
-        mock_bank,
+    mock_bank.add_builtin(
+        batch_processor,
         bpf_loader::id(),
         loader_v2_name,
         ProgramCacheEntry::new_builtin(
@@ -307,8 +314,8 @@ pub fn register_builtins(
 
     if with_loader_v4 {
         let loader_v4_name = "solana_loader_v4_program";
-        batch_processor.add_builtin(
-            mock_bank,
+        mock_bank.add_builtin(
+            batch_processor,
             loader_v4::id(),
             loader_v4_name,
             ProgramCacheEntry::new_builtin(
@@ -322,8 +329,8 @@ pub fn register_builtins(
     // In order to perform a transference of native tokens using the system instruction,
     // the system program builtin must be registered.
     let system_program_name = "system_program";
-    batch_processor.add_builtin(
-        mock_bank,
+    mock_bank.add_builtin(
+        batch_processor,
         solana_system_program::id(),
         system_program_name,
         ProgramCacheEntry::new_builtin(
@@ -335,8 +342,8 @@ pub fn register_builtins(
 
     // For testing realloc, we need the compute budget program
     let compute_budget_program_name = "compute_budget_program";
-    batch_processor.add_builtin(
-        mock_bank,
+    mock_bank.add_builtin(
+        batch_processor,
         compute_budget::id(),
         compute_budget_program_name,
         ProgramCacheEntry::new_builtin(
@@ -347,7 +354,7 @@ pub fn register_builtins(
     );
 }
 
-pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a>> {
+pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a, 'a>> {
     let compute_budget = SVMTransactionExecutionBudget::default();
     let vm_config = Config {
         max_call_depth: compute_budget.max_call_depth,
@@ -356,14 +363,14 @@ pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a>> {
         enable_stack_frame_gaps: true,
         instruction_meter_checkpoint_distance: 10000,
         enable_instruction_meter: true,
-        enable_instruction_tracing: true,
+        enable_register_tracing: true,
         enable_symbol_and_section_labels: true,
         reject_broken_elfs: true,
         noop_instruction_rate: 256,
         sanitize_user_provided_values: true,
         enabled_sbpf_versions: SBPFVersion::V0..=SBPFVersion::V3,
         optimize_rodata: false,
-        aligned_memory_mapping: true,
+        aligned_memory_mapping: false,
     };
 
     // These functions are system calls the compile contract calls during execution, so they
@@ -398,6 +405,12 @@ pub fn create_custom_loader<'a>() -> BuiltinProgram<InvokeContext<'a>> {
         .expect("Registration failed");
     loader
         .register_function("sol_get_rent_sysvar", SyscallGetRentSysvar::vm)
+        .expect("Registration failed");
+    loader
+        .register_function(
+            "sol_get_epoch_schedule_sysvar",
+            SyscallGetEpochScheduleSysvar::vm,
+        )
         .expect("Registration failed");
     loader
 }

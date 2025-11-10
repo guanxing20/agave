@@ -4,7 +4,7 @@ use {
     solana_quic_definitions::QUIC_PORT_OFFSET,
     solana_streamer::quic::{
         DEFAULT_MAX_CONNECTIONS_PER_IPADDR_PER_MINUTE, DEFAULT_MAX_STAKED_CONNECTIONS,
-        DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS, DEFAULT_TPU_COALESCE,
+        DEFAULT_MAX_STREAMS_PER_MS, DEFAULT_MAX_UNSTAKED_CONNECTIONS,
     },
     std::{
         net::{IpAddr, SocketAddr},
@@ -46,18 +46,11 @@ fn get_default_port_range() -> &'static str {
     range
 }
 
-fn get_default_tpu_coalesce_ms() -> &'static str {
-    let coalesce = DEFAULT_TPU_COALESCE.as_millis().to_string();
-    let coalesce: &'static str = Box::leak(coalesce.into_boxed_str());
-    coalesce
-}
-
 /// returns a parser which can validate input URL based on specified schemes.
 fn parse_url_with_scheme(expected_schemes: &'static [&'static str]) -> ValueParser {
     ValueParser::from(move |input: &str| {
         // Attempt to parse the input as a URL
-        let parsed_url =
-            Url::parse(input).map_err(|e| format!("Invalid URL '{}': {}", input, e))?;
+        let parsed_url = Url::parse(input).map_err(|e| format!("Invalid URL '{input}': {e}"))?;
 
         // Check the scheme of the URL
         if expected_schemes.contains(&parsed_url.scheme()) {
@@ -138,10 +131,6 @@ pub struct Cli {
     /// Max streams per second for a streamer.
     #[arg(long, default_value_t = DEFAULT_MAX_STREAMS_PER_MS)]
     pub max_streams_per_ms: u64,
-
-    /// Milliseconds to wait in the TPU receiver for packet coalescing.
-    #[arg(long, default_value = get_default_tpu_coalesce_ms())]
-    pub tpu_coalesce_ms: u64,
 
     /// Redirect logging to the specified file, '-' for standard error. Sending the
     /// SIGUSR1 signal to the vortexor process will cause it to re-open the log file.

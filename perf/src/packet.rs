@@ -50,7 +50,8 @@ impl BytesPacket {
     }
 
     #[cfg(feature = "dev-context-only-utils")]
-    pub fn from_bytes(dest: Option<&SocketAddr>, buffer: Bytes) -> Self {
+    pub fn from_bytes(dest: Option<&SocketAddr>, buffer: impl Into<Bytes>) -> Self {
+        let buffer = buffer.into();
         let mut meta = Meta {
             size: buffer.len(),
             ..Default::default()
@@ -133,6 +134,18 @@ impl BytesPacket {
     pub fn as_mut(&mut self) -> PacketRefMut<'_> {
         PacketRefMut::Bytes(self)
     }
+
+    #[inline]
+    pub fn buffer(&self) -> &Bytes {
+        &self.buffer
+    }
+
+    #[inline]
+    pub fn set_buffer(&mut self, buffer: impl Into<Bytes>) {
+        let buffer = buffer.into();
+        self.meta.size = buffer.len();
+        self.buffer = buffer;
+    }
 }
 
 #[cfg_attr(feature = "frozen-abi", derive(AbiExample, AbiEnumVisitor))]
@@ -140,6 +153,7 @@ impl BytesPacket {
 pub enum PacketBatch {
     Pinned(PinnedPacketBatch),
     Bytes(BytesPacketBatch),
+    Single(BytesPacket),
 }
 
 impl PacketBatch {
@@ -148,6 +162,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.first().map(PacketRef::from),
             Self::Bytes(batch) => batch.first().map(PacketRef::from),
+            Self::Single(packet) => Some(PacketRef::from(packet)),
         }
     }
 
@@ -156,6 +171,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.first_mut().map(PacketRefMut::from),
             Self::Bytes(batch) => batch.first_mut().map(PacketRefMut::from),
+            Self::Single(packet) => Some(PacketRefMut::from(packet)),
         }
     }
 
@@ -164,6 +180,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.is_empty(),
             Self::Bytes(batch) => batch.is_empty(),
+            Self::Single(_) => false,
         }
     }
 
@@ -172,6 +189,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.get(index).map(PacketRef::from),
             Self::Bytes(batch) => batch.get(index).map(PacketRef::from),
+            Self::Single(packet) => (index == 0).then_some(PacketRef::from(packet)),
         }
     }
 
@@ -179,6 +197,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.get_mut(index).map(PacketRefMut::from),
             Self::Bytes(batch) => batch.get_mut(index).map(PacketRefMut::from),
+            Self::Single(packet) => (index == 0).then_some(PacketRefMut::from(packet)),
         }
     }
 
@@ -186,6 +205,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => PacketBatchIter::Pinned(batch.iter()),
             Self::Bytes(batch) => PacketBatchIter::Bytes(batch.iter()),
+            Self::Single(packet) => PacketBatchIter::Bytes(core::array::from_ref(packet).iter()),
         }
     }
 
@@ -193,19 +213,27 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => PacketBatchIterMut::Pinned(batch.iter_mut()),
             Self::Bytes(batch) => PacketBatchIterMut::Bytes(batch.iter_mut()),
+            Self::Single(packet) => {
+                PacketBatchIterMut::Bytes(core::array::from_mut(packet).iter_mut())
+            }
         }
     }
 
-    pub fn par_iter(&self) -> PacketBatchParIter {
+    pub fn par_iter(&self) -> PacketBatchParIter<'_> {
         match self {
             Self::Pinned(batch) => {
                 PacketBatchParIter::Pinned(batch.par_iter().map(PacketRef::from))
             }
             Self::Bytes(batch) => PacketBatchParIter::Bytes(batch.par_iter().map(PacketRef::from)),
+            Self::Single(packet) => PacketBatchParIter::Bytes(
+                core::array::from_ref(packet)
+                    .par_iter()
+                    .map(PacketRef::from),
+            ),
         }
     }
 
-    pub fn par_iter_mut(&mut self) -> PacketBatchParIterMut {
+    pub fn par_iter_mut(&mut self) -> PacketBatchParIterMut<'_> {
         match self {
             Self::Pinned(batch) => {
                 PacketBatchParIterMut::Pinned(batch.par_iter_mut().map(PacketRefMut::from))
@@ -213,6 +241,11 @@ impl PacketBatch {
             Self::Bytes(batch) => {
                 PacketBatchParIterMut::Bytes(batch.par_iter_mut().map(PacketRefMut::from))
             }
+            Self::Single(packet) => PacketBatchParIterMut::Bytes(
+                core::array::from_mut(packet)
+                    .par_iter_mut()
+                    .map(PacketRefMut::from),
+            ),
         }
     }
 
@@ -220,6 +253,7 @@ impl PacketBatch {
         match self {
             Self::Pinned(batch) => batch.len(),
             Self::Bytes(batch) => batch.len(),
+            Self::Single(_) => 1,
         }
     }
 }
@@ -685,7 +719,7 @@ impl PinnedPacketBatch {
                     // TODO: This should never happen. Instead the caller should
                     // break the payload into smaller messages, and here any errors
                     // should be propagated.
-                    error!("Couldn't write to packet {:?}. Data skipped.", e);
+                    error!("Couldn't write to packet {e:?}. Data skipped.");
                     packet.meta_mut().set_discard(true);
                 }
             } else {

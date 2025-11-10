@@ -2,7 +2,6 @@ use {
     crate::repair::{quic_endpoint::RemoteRequest, serve_repair::ServeRepair},
     bytes::Bytes,
     crossbeam_channel::{unbounded, Receiver, Sender},
-    solana_ledger::blockstore::Blockstore,
     solana_perf::{packet::PacketBatch, recycler::Recycler},
     solana_streamer::{
         socket::SocketAddrSpace,
@@ -27,7 +26,6 @@ impl ServeRepairService {
         remote_request_sender: Sender<RemoteRequest>,
         remote_request_receiver: Receiver<RemoteRequest>,
         repair_response_quic_sender: AsyncSender<(SocketAddr, Bytes)>,
-        blockstore: Arc<Blockstore>,
         serve_repair_socket: UdpSocket,
         socket_addr_space: SocketAddrSpace,
         stats_reporter_sender: Sender<Box<dyn FnOnce() + Send>>,
@@ -35,11 +33,6 @@ impl ServeRepairService {
     ) -> Self {
         let (request_sender, request_receiver) = unbounded();
         let serve_repair_socket = Arc::new(serve_repair_socket);
-        trace!(
-            "ServeRepairService: id: {}, listening on: {:?}",
-            &serve_repair.my_id(),
-            serve_repair_socket.local_addr().unwrap()
-        );
         let t_receiver = streamer::receiver(
             "solRcvrServeRep".to_string(),
             serve_repair_socket.clone(),
@@ -65,7 +58,6 @@ impl ServeRepairService {
             Some(stats_reporter_sender),
         );
         let t_listen = serve_repair.listen(
-            blockstore,
             remote_request_receiver,
             response_sender,
             repair_response_quic_sender,

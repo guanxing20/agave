@@ -2,13 +2,15 @@
 use {
     crate::{
         banking_stage::{
-            update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage, LikeClusterInfo,
+            transaction_scheduler::scheduler_controller::SchedulerConfig,
+            update_bank_forks_and_poh_recorder_for_new_tpu_bank, BankingStage, BankingStageHandle,
+            LikeClusterInfo,
         },
         banking_trace::{
             BankingTracer, ChannelLabel, Channels, TimedTracedEvent, TracedEvent, TracedSender,
             TracerThread, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, BASENAME,
         },
-        validator::{BlockProductionMethod, TransactionStructure},
+        validator::BlockProductionMethod,
     },
     agave_banking_stage_ingress_types::BankingPacketBatch,
     assert_matches::assert_matches,
@@ -18,19 +20,18 @@ use {
     log::*,
     solana_clock::{Slot, DEFAULT_MS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
     solana_genesis_config::GenesisConfig,
-    solana_gossip::{
-        cluster_info::{ClusterInfo, Node},
-        contact_info::ContactInfoQuery,
-    },
+    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfoQuery, node::Node},
     solana_keypair::Keypair,
     solana_ledger::{
         blockstore::{Blockstore, PurgeType},
         leader_schedule_cache::LeaderScheduleCache,
     },
-    solana_net_utils::bind_to_localhost,
+    solana_net_utils::sockets::{bind_in_range_with_config, SocketConfiguration},
     solana_poh::{
+        poh_controller::PohController,
         poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
         poh_service::{PohService, DEFAULT_HASHES_PER_BATCH, DEFAULT_PINNED_CPU_CORE},
+        record_channels::record_channels,
         transaction_recorder::TransactionRecorder,
     },
     solana_pubkey::Pubkey,
@@ -49,6 +50,7 @@ use {
         fmt::Display,
         fs::File,
         io::{self, BufRead, BufReader},
+        net::{IpAddr, Ipv4Addr},
         path::PathBuf,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -58,6 +60,7 @@ use {
         time::{Duration, Instant, SystemTime},
     },
     thiserror::Error,
+    tokio::sync::mpsc,
 };
 
 /// This creates a simulated environment around `BankingStage` to produce leader's blocks based on
@@ -193,8 +196,8 @@ impl BankingTraceEvents {
             ) {
                 // Silence errors here as this can happen under normal operation...
                 warn!(
-                    "Reading {:?} failed {:?} due to file corruption or unclean validator shutdown",
-                    event_file_path, read_result,
+                    "Reading {event_file_path:?} failed {read_result:?} due to file corruption or \
+                     unclean validator shutdown",
                 );
             } else {
                 read_result?
@@ -304,11 +307,7 @@ impl SimulatorLoopLogger {
                     } else {
                         "-"
                     },
-                    if elapsed_simulation_time > elapsed_event_time {
-                        elapsed_simulation_time - elapsed_event_time
-                    } else {
-                        elapsed_event_time - elapsed_simulation_time
-                    },
+                    elapsed_simulation_time.abs_diff(elapsed_event_time),
                     elapsed_simulation_time,
                     elapsed_event_time,
                 );
@@ -346,10 +345,14 @@ struct SenderLoop {
 impl SenderLoop {
     fn log_starting(&self) {
         info!(
-            "simulating events: {} (out of {}), starting at slot {} (based on {} from traced event slot: {}) (warmup: -{:?})",
-            self.timed_batches_to_send.len(), self.total_batch_count, self.first_simulated_slot,
+            "simulating events: {} (out of {}), starting at slot {} (based on {} from traced \
+             event slot: {}) (warmup: -{:?})",
+            self.timed_batches_to_send.len(),
+            self.total_batch_count,
+            self.first_simulated_slot,
             SenderLoopLogger::format_as_timestamp(self.raw_base_event_time),
-            self.parent_slot, WARMUP_DURATION,
+            self.parent_slot,
+            WARMUP_DURATION,
         );
     }
 
@@ -412,6 +415,7 @@ struct SimulatorLoop {
     freeze_time_by_slot: FreezeTimeBySlot,
     base_event_time: SystemTime,
     poh_recorder: Arc<RwLock<PohRecorder>>,
+    poh_controller: PohController,
     simulated_leader: Pubkey,
     bank_forks: Arc<RwLock<BankForks>>,
     blockstore: Arc<Blockstore>,
@@ -432,7 +436,7 @@ impl SimulatorLoop {
     }
 
     fn start(
-        self,
+        mut self,
         base_simulation_time: SystemTime,
         sender_thread: EventSenderThread,
     ) -> (EventSenderThread, Sender<Slot>) {
@@ -453,10 +457,9 @@ impl SimulatorLoop {
                     GRACE_TICKS_FACTOR * MAX_GRACE_SLOTS,
                 );
                 debug!("{next_leader_slot:?}");
-                self.poh_recorder
-                    .write()
-                    .unwrap()
-                    .reset(bank.clone_without_scheduler(), next_leader_slot);
+                self.poh_controller
+                    .reset_sync(bank.clone_without_scheduler(), next_leader_slot)
+                    .unwrap();
                 info!("Bank::new_from_parent()!");
 
                 logger.log_jitter(&bank);
@@ -499,10 +502,15 @@ impl SimulatorLoop {
                 self.retransmit_slots_sender.send(bank.slot()).unwrap();
                 update_bank_forks_and_poh_recorder_for_new_tpu_bank(
                     &self.bank_forks,
-                    &self.poh_recorder,
+                    &mut self.poh_controller,
                     new_bank,
-                    false,
                 );
+                // Wait for the controller message to be processed.
+                // This loop assumes that
+                // `update_bank_forks_and_poh_recorder_for_new_tpu_bank`
+                // takes immediate effect in PohRecorder's working bank.
+                while self.poh_controller.has_pending_message() {}
+
                 (bank, bank_created) = (
                     self.bank_forks
                         .read()
@@ -524,7 +532,7 @@ impl SimulatorLoop {
 
 struct SimulatorThreads {
     poh_service: PohService,
-    banking_stage: BankingStage,
+    banking_stage: BankingStageHandle,
     broadcast_stage: BroadcastStage,
     retracer_thread: TracerThread,
     exit: Arc<AtomicBool>,
@@ -599,10 +607,7 @@ impl<'a> SenderLoopLogger<'a> {
         batch_count: usize,
         tx_count: usize,
     ) {
-        debug!(
-            "sent {:?} {} batches ({} txes)",
-            label, batch_count, tx_count
-        );
+        debug!("sent {label:?} {batch_count} batches ({tx_count} txes)");
 
         use ChannelLabel::*;
         let (total_batch_count, total_tx_count) = match label {
@@ -630,9 +635,16 @@ impl<'a> SenderLoopLogger<'a> {
             let gossip_vote_tps =
                 (self.gossip_vote_tx_count - self.last_gossip_vote_tx_count) as f64 / duration;
             info!(
-                "senders(non-,tpu-,gossip-vote): tps: {:.0} (={:.0}+{:.0}+{:.0}) over {:?} not-recved: ({}+{}+{})",
-                tps, non_vote_tps, tpu_vote_tps, gossip_vote_tps, log_interval,
-                self.non_vote_sender.len(), self.tpu_vote_sender.len(), self.gossip_vote_sender.len(),
+                "senders(non-,tpu-,gossip-vote): tps: {:.0} (={:.0}+{:.0}+{:.0}) over {:?} \
+                 not-recved: ({}+{}+{})",
+                tps,
+                non_vote_tps,
+                tpu_vote_tps,
+                gossip_vote_tps,
+                log_interval,
+                self.non_vote_sender.len(),
+                self.tpu_vote_sender.len(),
+                self.gossip_vote_sender.len(),
             );
             self.last_log_duration = simulation_duration;
             self.last_tx_count = current_tx_count;
@@ -689,7 +701,6 @@ impl BankingSimulator {
         bank_forks: Arc<RwLock<BankForks>>,
         blockstore: Arc<Blockstore>,
         block_production_method: BlockProductionMethod,
-        transaction_struct: TransactionStructure,
     ) -> (SenderLoop, SimulatorLoop, SimulatorThreads) {
         let parent_slot = self.parent_slot().unwrap();
         let mut packet_batches_by_time = self.banking_trace_events.packet_batches_by_time;
@@ -739,8 +750,9 @@ impl BankingSimulator {
             exit.clone(),
         );
         let poh_recorder = Arc::new(RwLock::new(poh_recorder));
-        let (record_sender, record_receiver) = unbounded();
-        let transaction_recorder = TransactionRecorder::new(record_sender, exit.clone());
+        let (record_sender, record_receiver) = record_channels(false);
+        let transaction_recorder = TransactionRecorder::new(record_sender);
+        let (poh_controller, poh_service_message_receiver) = PohController::new();
         let poh_service = PohService::new(
             poh_recorder.clone(),
             &genesis_config.poh_config,
@@ -749,6 +761,7 @@ impl BankingSimulator {
             DEFAULT_PINNED_CPU_CORE,
             DEFAULT_HASHES_PER_BATCH,
             record_receiver,
+            poh_service_message_receiver,
         );
 
         // Enable BankingTracer to approximate the real environment as close as possible because
@@ -768,15 +781,8 @@ impl BankingSimulator {
         )))
         .unwrap();
         assert!(retracer.is_enabled());
-        info!(
-            "Enabled banking retracer (dir_byte_limit: {})",
-            BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT,
-        );
+        info!("Enabled banking retracer (dir_byte_limit: {BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT})",);
 
-        // Create a partially-dummy ClusterInfo for the banking stage.
-        let cluster_info_for_banking = Arc::new(DummyClusterInfo {
-            id: simulated_leader.into(),
-        });
         let Channels {
             non_vote_sender,
             non_vote_receiver,
@@ -796,7 +802,7 @@ impl BankingSimulator {
 
         // Create a completely-dummy ClusterInfo for the broadcast stage.
         // We only need it to write shreds into the blockstore and it seems given ClusterInfo is
-        // irrelevant for the neccesary minimum work for this simulation.
+        // irrelevant for the necessary minimum work for this simulation.
         let random_keypair = Arc::new(Keypair::new());
         let cluster_info_for_broadcast = Arc::new(ClusterInfo::new(
             Node::new_localhost_with_pubkey(&random_keypair.pubkey()).info,
@@ -805,8 +811,14 @@ impl BankingSimulator {
         ));
         // Broadcast stage is needed to save the simulated blocks for post-run analysis by
         // inserting produced shreds into the blockstore.
+        let (_, socket) = bind_in_range_with_config(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            (1024, u16::MAX),
+            SocketConfiguration::default(),
+        )
+        .expect("should bind");
         let broadcast_stage = BroadcastStageType::Standard.new_broadcast_stage(
-            vec![bind_to_localhost().unwrap()],
+            vec![socket],
             cluster_info_for_broadcast.clone(),
             entry_receiver,
             retransmit_slots_receiver,
@@ -815,25 +827,26 @@ impl BankingSimulator {
             bank_forks.clone(),
             shred_version,
             sender,
+            None,
         );
 
         info!("Start banking stage!...");
         let prioritization_fee_cache = &Arc::new(PrioritizationFeeCache::new(0u64));
         let banking_stage = BankingStage::new_num_threads(
             block_production_method.clone(),
-            transaction_struct.clone(),
-            &cluster_info_for_banking,
-            &poh_recorder,
+            poh_recorder.clone(),
             transaction_recorder,
             non_vote_receiver,
             tpu_vote_receiver,
             gossip_vote_receiver,
-            BankingStage::num_threads(),
+            mpsc::channel(1).1,
+            BankingStage::default_num_workers(),
+            SchedulerConfig::default(),
             None,
             replay_vote_sender,
             None,
             bank_forks.clone(),
-            prioritization_fee_cache,
+            prioritization_fee_cache.clone(),
         );
 
         let (&_slot, &raw_base_event_time) = freeze_time_by_slot
@@ -882,6 +895,7 @@ impl BankingSimulator {
             freeze_time_by_slot,
             base_event_time,
             poh_recorder,
+            poh_controller,
             simulated_leader,
             bank_forks,
             blockstore,
@@ -907,14 +921,12 @@ impl BankingSimulator {
         bank_forks: Arc<RwLock<BankForks>>,
         blockstore: Arc<Blockstore>,
         block_production_method: BlockProductionMethod,
-        transaction_struct: TransactionStructure,
     ) -> Result<(), SimulateError> {
         let (sender_loop, simulator_loop, simulator_threads) = self.prepare_simulation(
             genesis_config,
             bank_forks,
             blockstore,
             block_production_method,
-            transaction_struct,
         );
 
         sender_loop.log_starting();

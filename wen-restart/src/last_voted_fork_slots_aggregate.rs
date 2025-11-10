@@ -244,12 +244,12 @@ mod tests {
         crate::{
             last_voted_fork_slots_aggregate::*, solana::wen_restart_proto::LastVotedForkSlotsRecord,
         },
+        solana_clock::Slot,
         solana_gossip::restart_crds_values::RestartLastVotedForkSlots,
         solana_hash::Hash,
-        solana_program::clock::Slot,
         solana_runtime::{
             bank::Bank,
-            epoch_stakes::EpochStakes,
+            epoch_stakes::VersionedEpochStakes,
             genesis_utils::{
                 create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
             },
@@ -257,7 +257,7 @@ mod tests {
         solana_signer::Signer,
         solana_time_utils::timestamp,
         solana_vote::vote_account::VoteAccount,
-        solana_vote_program::vote_state::create_account_with_authorized,
+        solana_vote_program::vote_state::create_v4_account_with_authorized,
     };
 
     const TOTAL_VALIDATOR_COUNT: u16 = 10;
@@ -273,7 +273,7 @@ mod tests {
     }
 
     fn test_aggregate_init() -> TestAggregateInitResult {
-        solana_logger::setup();
+        agave_logger::setup();
         let validator_voting_keypairs: Vec<_> = (0..TOTAL_VALIDATOR_COUNT)
             .map(|_| ValidatorVoteKeypairs::new_rand())
             .collect();
@@ -286,7 +286,7 @@ mod tests {
         let bank0 = bank_forks.read().unwrap().root_bank();
         let bank1 = Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 1);
         bank_forks.write().unwrap().insert(bank1);
-        assert!(bank_forks.write().unwrap().set_root(1, None, None).is_ok());
+        bank_forks.write().unwrap().set_root(1, None, None);
         let root_bank = bank_forks.read().unwrap().root_bank();
         let root_slot = root_bank.slot();
         let last_voted_fork_slots = vec![
@@ -688,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_from_record_failures() {
-        solana_logger::setup();
+        agave_logger::setup();
         let mut test_state = test_aggregate_init();
         let last_vote_bankhash = Hash::new_unique();
         let mut last_voted_fork_slots_record = LastVotedForkSlotsRecord {
@@ -779,10 +779,11 @@ mod tests {
                     authorized_voter,
                     (
                         stake,
-                        VoteAccount::try_from(create_account_with_authorized(
+                        VoteAccount::try_from(create_v4_account_with_authorized(
                             &node_id,
                             &authorized_voter,
                             &node_id,
+                            None,
                             0,
                             100,
                         ))
@@ -791,8 +792,8 @@ mod tests {
                 )
             })
             .collect();
-        let epoch1_eopch_stakes = EpochStakes::new_for_tests(vote_accounts_hash_map, 1);
-        new_root_bank.set_epoch_stakes_for_test(1, epoch1_eopch_stakes);
+        let epoch1_epoch_stakes = VersionedEpochStakes::new_for_tests(vote_accounts_hash_map, 1);
+        new_root_bank.set_epoch_stakes_for_test(1, epoch1_epoch_stakes);
 
         let last_voted_fork_slots = vec![root_bank.slot() + 1, root_bank.get_slots_in_epoch(0) + 1];
         let slots_aggregate = LastVotedForkSlotsAggregate::new(

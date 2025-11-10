@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 #![allow(clippy::arithmetic_side_effects)]
 
 pub mod nonblocking;
@@ -12,8 +21,11 @@ use {
             QuicClient, QuicClientConnection as NonblockingQuicClientConnection,
             QuicLazyInitializedEndpoint,
         },
-        quic_client::QuicClientConnection as BlockingQuicClientConnection,
+        quic_client::{
+            close_quic_connection, QuicClientConnection as BlockingQuicClientConnection,
+        },
     },
+    log::debug,
     quic_client::get_runtime,
     quinn::{Endpoint, EndpointConfig, TokioRuntime},
     solana_connection_cache::{
@@ -69,6 +81,19 @@ impl ConnectionPool for QuicPool {
             self.endpoint.clone(),
             *addr,
         ))))
+    }
+}
+
+impl Drop for QuicPool {
+    fn drop(&mut self) {
+        debug!(
+            "Dropping QuicPool with {} connections",
+            self.connections.len()
+        );
+        for connection in self.connections.drain(..) {
+            // Explicitly drop each connection to ensure resources are released
+            close_quic_connection(connection.0.clone());
+        }
     }
 }
 

@@ -22,7 +22,6 @@ use {
         recycler::Recycler,
         sigverify,
     },
-    solana_rayon_threadlimit::get_max_thread_count,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_transaction::{
         versioned::VersionedTransaction, Transaction, TransactionVerificationMode,
@@ -36,6 +35,7 @@ use {
         thread::{self, JoinHandle},
         time::Instant,
     },
+    wincode::{containers::Pod, SchemaRead, SchemaWrite},
 };
 
 pub type EntrySender = Sender<Vec<Entry>>;
@@ -50,7 +50,7 @@ pub fn init_poh() {
 fn init(name: &OsStr) {
     static INIT_HOOK: Once = Once::new();
 
-    info!("Loading {:?}", name);
+    info!("Loading {name:?}");
     INIT_HOOK.call_once(|| {
         let path;
         let lib_name = if let Some(perf_libs_path) = solana_perf::perf_libs::locate_perf_libs() {
@@ -112,23 +112,25 @@ pub struct Api<'a> {
 /// * For TPU: `solana_core::banking_stage::BankingStage::process_and_record_transactions()`
 /// * For TVU: `solana_core::replay_stage::ReplayStage::replay_blockstore_into_bank()`
 ///
+/// Until SIMD83 is activated:
 /// All transactions in the `transactions` field have to follow the read/write locking restrictions
 /// with regard to the accounts they reference. A single account can be either written by a single
 /// transaction, or read by one or more transactions, but not both.
-///
 /// This enforcement is done via a call to `solana_runtime::accounts::Accounts::lock_accounts()`
 /// with the `txs` argument holding all the `transactions` in the `Entry`.
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone)]
+#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq, Clone, SchemaWrite, SchemaRead)]
 pub struct Entry {
     /// The number of hashes since the previous Entry ID.
     pub num_hashes: u64,
 
     /// The SHA-256 hash `num_hashes` after the previous Entry ID.
+    #[wincode(with = "Pod<Hash>")]
     pub hash: Hash,
 
     /// An unordered list of transactions that were observed before the Entry ID was
     /// generated. They may have been observed before a previous Entry ID but were
     /// pushed back into this list to ensure deterministic interpretation of the ledger.
+    #[wincode(with = "Vec<crate::wincode::VersionedTransaction>")]
     pub transactions: Vec<VersionedTransaction>,
 }
 
@@ -888,10 +890,8 @@ impl EntrySlice for [Entry] {
             if entry.is_tick() {
                 if *tick_hash_count != hashes_per_tick {
                     warn!(
-                        "invalid tick hash count!: entry: {:#?}, tick_hash_count: {}, hashes_per_tick: {}",
-                        entry,
-                        tick_hash_count,
-                        hashes_per_tick
+                        "invalid tick hash count!: entry: {entry:#?}, tick_hash_count: \
+                         {tick_hash_count}, hashes_per_tick: {hashes_per_tick}"
                     );
                     return false;
                 }
@@ -959,9 +959,10 @@ pub fn thread_pool_for_tests() -> ThreadPool {
         .expect("new rayon threadpool")
 }
 
+#[cfg(feature = "dev-context-only-utils")]
 pub fn thread_pool_for_benches() -> ThreadPool {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(get_max_thread_count())
+        .num_threads(num_cpus::get())
         .thread_name(|i| format!("solEntryBnch{i:02}"))
         .build()
         .expect("new rayon threadpool")
@@ -1078,6 +1079,7 @@ mod tests {
                         None,
                         SimpleAddressLoader::Disabled,
                         &ReservedAccountKeys::empty_key_set(),
+                        true,
                     )
                 }?;
 
@@ -1200,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1222,7 +1224,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes1() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1249,7 +1251,7 @@ mod tests {
 
     #[test]
     fn test_verify_slice_with_hashes_and_transactions() {
-        solana_logger::setup();
+        agave_logger::setup();
         let thread_pool = thread_pool_for_tests();
 
         let zero = Hash::default();
@@ -1402,11 +1404,11 @@ mod tests {
 
     #[test]
     fn test_poh_verify_fuzz() {
-        solana_logger::setup();
+        agave_logger::setup();
         for _ in 0..100 {
             let mut time = Measure::start("ticks");
             let num_ticks = thread_rng().gen_range(1..100);
-            info!("create {} ticks:", num_ticks);
+            info!("create {num_ticks} ticks:");
             let mut entries = create_random_ticks(num_ticks, 100, Hash::default());
             time.stop();
 
@@ -1417,12 +1419,12 @@ mod tests {
                 entries[modify_idx].hash = hash(&[1, 2, 3]);
             }
 
-            info!("done.. {}", time);
+            info!("done.. {time}");
             let mut time = Measure::start("poh");
             let res = entries.verify(&Hash::default(), &thread_pool_for_tests());
             assert_eq!(res, !modified);
             time.stop();
-            info!("{} {}", time, res);
+            info!("{time} {res}");
         }
     }
 

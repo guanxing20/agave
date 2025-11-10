@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(feature = "agave-unstable-api"),
+    deprecated(
+        since = "3.1.0",
+        note = "This crate has been marked for formal inclusion in the Agave Unstable API. From \
+                v4.0.0 onward, the `agave-unstable-api` crate feature must be specified to \
+                acknowledge use of an interface that may break without warning."
+    )
+)]
 //! A client for the ledger state, from the perspective of an arbitrary validator.
 //!
 //! Use start_tcp_client() to create a client and then import BanksClientExt to
@@ -17,12 +26,15 @@ use {
         BanksRequest, BanksResponse, BanksTransactionResultWithMetadata,
         BanksTransactionResultWithSimulation,
     },
+    solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
+    solana_hash::Hash,
     solana_message::Message,
-    solana_program::{
-        clock::Slot, hash::Hash, program_pack::Pack, pubkey::Pubkey, rent::Rent, sysvar::Sysvar,
-    },
+    solana_program_pack::Pack,
+    solana_pubkey::Pubkey,
+    solana_rent::Rent,
     solana_signature::Signature,
+    solana_sysvar::SysvarSerialize,
     solana_transaction::versioned::VersionedTransaction,
     tarpc::{
         client::{self, NewClient, RequestDispatch},
@@ -179,7 +191,7 @@ impl BanksClient {
     }
 
     /// Return the cluster Sysvar
-    pub async fn get_sysvar<T: Sysvar>(&self) -> Result<T, BanksClientError> {
+    pub async fn get_sysvar<T: SysvarSerialize>(&self) -> Result<T, BanksClientError> {
         let sysvar = self
             .get_account(T::id())
             .await?

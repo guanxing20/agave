@@ -4,14 +4,17 @@ use {
     solana_cli_config::ConfigInput,
     solana_commitment_config::CommitmentConfig,
     solana_keypair::Keypair,
+    solana_net_utils::sockets::unique_port_range_for_tests,
     solana_pubkey::Pubkey,
     solana_rpc_client::nonblocking::rpc_client::RpcClient,
     solana_signer::Signer,
     solana_streamer::{
-        nonblocking::testing_utilities::{
-            make_client_endpoint, setup_quic_server, SpawnTestServerResult, TestServerConfig,
+        nonblocking::{
+            swqos::SwQosConfig,
+            testing_utilities::{make_client_endpoint, setup_quic_server, SpawnTestServerResult},
         },
         packet::PacketBatch,
+        quic::QuicStreamerConfig,
         streamer::StakedNodes,
     },
     solana_tpu_client_next::{
@@ -27,7 +30,7 @@ use {
         collections::HashMap,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         num::Saturating,
-        sync::{atomic::Ordering, Arc},
+        sync::Arc,
         time::Duration,
     },
     tokio::{
@@ -42,7 +45,10 @@ use {
 };
 
 fn test_config(stake_identity: Option<Keypair>) -> ConnectionWorkersSchedulerConfig {
-    let address = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 0);
+    let address = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        unique_port_range_for_tests(1).start,
+    );
     ConnectionWorkersSchedulerConfig {
         bind: BindTarget::Address(address),
         stake_identity: stake_identity.map(|identity| StakeIdentity::new(&identity)),
@@ -191,11 +197,15 @@ fn spawn_tx_sender(
 async fn test_basic_transactions_sending() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
-    } = setup_quic_server(None, TestServerConfig::default());
+        cancel,
+    } = setup_quic_server(
+        None,
+        QuicStreamerConfig::default_for_tests(),
+        SwQosConfig::default(),
+    );
 
     // Setup sending txs
     let tx_size = 1;
@@ -221,10 +231,8 @@ async fn test_basic_transactions_sending() {
             let elapsed = now.elapsed();
             assert!(
                 elapsed < TEST_MAX_TIME,
-                "Failed to send {} transaction in {:?}.  Only sent {}",
-                expected_num_txs,
-                elapsed,
-                actual_num_packets,
+                "Failed to send {expected_num_txs} transaction in {elapsed:?}. Only sent \
+                 {actual_num_packets}",
             );
         }
 
@@ -252,7 +260,7 @@ async fn test_basic_transactions_sending() {
     assert_eq!(stats.successfully_sent, expected_num_txs as u64,);
 
     // Stop server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -283,11 +291,15 @@ async fn count_received_packets_for(
 async fn test_connection_denied_until_allowed() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
-    } = setup_quic_server(None, TestServerConfig::default());
+        cancel,
+    } = setup_quic_server(
+        None,
+        QuicStreamerConfig::default_for_tests(),
+        SwQosConfig::default(),
+    );
 
     // To prevent server from accepting a new connection, we use the following observation.
     // Since max_connections_per_peer == 1 (< max_unstaked_connections == 500), if we create a first
@@ -313,52 +325,54 @@ async fn test_connection_denied_until_allowed() {
     let actual_num_packets = count_received_packets_for(receiver, tx_size, TEST_MAX_TIME).await;
     assert!(
         actual_num_packets < expected_num_txs,
-        "Expected to receive {expected_num_txs} packets in {TEST_MAX_TIME:?}\n\
-         Got packets: {actual_num_packets}"
+        "Expected to receive {expected_num_txs} packets in {TEST_MAX_TIME:?} Got packets: \
+         {actual_num_packets}"
     );
 
     // Wait for the exchange to finish.
     tx_sender_shutdown.await;
     let stats = join_scheduler(scheduler_handle).await;
-    // in case of pruning, server closes the connection with code 1 and error
-    // message b"dropped". This might lead to connection error
-    // (ApplicationClosed::ApplicationClose) or to stream error
-    // (ConnectionLost::ApplicationClosed::ApplicationClose).
-    assert_eq!(
-        stats.write_error_connection_lost + stats.connection_error_application_closed,
-        1
+    // With proactive detection, we detect rejection immediately and retry within test duration.
+    // Expect at least 2 errors: initial rejection + retry attempts.
+    assert!(
+        stats.write_error_connection_lost + stats.connection_error_application_closed >= 2,
+        "Expected at least 2 connection errors, got write_error_connection_lost: {}, \
+         connection_error_application_closed: {}",
+        stats.write_error_connection_lost,
+        stats.connection_error_application_closed
     );
 
     drop(throttling_connection);
 
     // Exit server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
 // Check that if the client connection has been pruned, client manages to
-// reestablish it. Pruning will lead to 1 packet loss, because when we send the
-// next packet we will reestablish connection.
+// reestablish it. With more packets, we can observe the impact of pruning
+// even with proactive detection.
 #[tokio::test]
 async fn test_connection_pruned_and_reopened() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
+        cancel,
     } = setup_quic_server(
         None,
-        TestServerConfig {
-            max_connections_per_peer: 100,
+        QuicStreamerConfig {
+            max_connections_per_unstaked_peer: 100,
             max_unstaked_connections: 1,
-            ..Default::default()
+            ..QuicStreamerConfig::default_for_tests()
         },
+        SwQosConfig::default(),
     );
 
     // Setup sending txs
     let tx_size = 1;
-    let expected_num_txs: usize = 16;
+    let expected_num_txs: usize = 48;
     let SpawnTxGenerator {
         tx_receiver,
         tx_sender_shutdown,
@@ -378,17 +392,14 @@ async fn test_connection_pruned_and_reopened() {
     // Wait for the exchange to finish.
     tx_sender_shutdown.await;
     let stats = join_scheduler(scheduler_handle).await;
-    // in case of pruning, server closes the connection with code 1 and error
-    // message b"dropped". This might lead to connection error
-    // (ApplicationClosed::ApplicationClose) or to stream error
-    // (ConnectionLost::ApplicationClosed::ApplicationClose).
-    assert_eq!(
-        stats.connection_error_application_closed + stats.write_error_connection_lost,
-        1,
+    // Proactive detection catches pruning immediately, expect multiple retries.
+    assert!(
+        stats.connection_error_application_closed + stats.write_error_connection_lost >= 1,
+        "Expected at least 1 connection error from pruning and retries. Stats: {stats:?}"
     );
 
     // Exit server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -402,20 +413,21 @@ async fn test_staked_connection() {
 
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
+        cancel,
     } = setup_quic_server(
         Some(staked_nodes),
-        TestServerConfig {
+        QuicStreamerConfig {
             // Must use at least the number of endpoints (10) because
             // `max_staked_connections` and `max_unstaked_connections` are
             // cumulative for all the endpoints.
             max_staked_connections: 10,
             max_unstaked_connections: 0,
-            ..Default::default()
+            ..QuicStreamerConfig::default_for_tests()
         },
+        SwQosConfig::default(),
     );
 
     // Setup sending txs
@@ -446,7 +458,7 @@ async fn test_staked_connection() {
     );
 
     // Exit server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -457,11 +469,15 @@ async fn test_staked_connection() {
 async fn test_connection_throttling() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
-    } = setup_quic_server(None, TestServerConfig::default());
+        cancel,
+    } = setup_quic_server(
+        None,
+        QuicStreamerConfig::default_for_tests(),
+        SwQosConfig::default(),
+    );
 
     // Setup sending txs
     let tx_size = 1;
@@ -493,7 +509,7 @@ async fn test_connection_throttling() {
     );
 
     // Exit server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -526,11 +542,15 @@ async fn test_no_host() {
     // Wait for the generator to finish.
     tx_sender_shutdown.await;
 
-    // While attempting to establish a connection with a nonexistent host, we fill the worker's
-    // channel.
+    // For each transaction, we will check if worker exists and active. In this
+    // case, worker will never be active because when failed creating
+    // connection, we stop it. So scheduler will `max_send_attempts` try to
+    // create worker and fail each time.
     let stats = join_scheduler(scheduler_handle).await;
-    // `5` because `config.max_reconnect_attempts` is 4
-    assert_eq!(stats.connect_error_invalid_remote_address, 5);
+    assert_eq!(
+        stats.connect_error_invalid_remote_address,
+        max_send_attempts as u64
+    );
 }
 
 // Check that when the client is rate-limited by server, we update counters
@@ -544,24 +564,26 @@ async fn test_no_host() {
 async fn test_rate_limiting() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
+        cancel,
     } = setup_quic_server(
         None,
-        TestServerConfig {
-            max_connections_per_peer: 100,
+        QuicStreamerConfig {
+            max_connections_per_unstaked_peer: 100,
             max_connections_per_ipaddr_per_min: 1,
-            ..Default::default()
+            ..QuicStreamerConfig::default_for_tests()
         },
+        SwQosConfig::default(),
     );
 
+    // open a connection to consume the limit
     let connection_to_reach_limit = make_client_endpoint(&server_address, None).await;
     drop(connection_to_reach_limit);
 
-    // Setup sending txs
-    let tx_size = 1;
+    // Setup sending txs which are full packets in size
+    let tx_size = 1024;
     let expected_num_txs: usize = 16;
     let SpawnTxGenerator {
         tx_receiver,
@@ -582,14 +604,16 @@ async fn test_rate_limiting() {
     scheduler_cancel.cancel();
     let stats = join_scheduler(scheduler_handle).await;
 
-    // We do not expect to see any errors, as the connection is in the pending state still, when we
-    // do the shutdown.  If we increase the time we wait in `count_received_packets_for`, we would
-    // start seeing a `connection_error_timed_out` incremented to 1.  Potentially, we may want to
-    // accept both 0 and 1 as valid values for it.
-    assert_eq!(stats, SendTransactionStatsNonAtomic::default());
+    assert!(
+        stats
+            == SendTransactionStatsNonAtomic {
+                connection_error_timed_out: 1,
+                ..Default::default()
+            }
+    );
 
     // Stop the server.
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -602,17 +626,18 @@ async fn test_rate_limiting() {
 async fn test_rate_limiting_establish_connection() {
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
+        cancel,
     } = setup_quic_server(
         None,
-        TestServerConfig {
-            max_connections_per_peer: 100,
+        QuicStreamerConfig {
+            max_connections_per_unstaked_peer: 100,
             max_connections_per_ipaddr_per_min: 1,
-            ..Default::default()
+            ..QuicStreamerConfig::default_for_tests()
         },
+        SwQosConfig::default(),
     );
 
     let connection_to_reach_limit = make_client_endpoint(&server_address, None).await;
@@ -634,9 +659,9 @@ async fn test_rate_limiting_establish_connection() {
         count_received_packets_for(receiver, tx_size, Duration::from_secs(70)).await;
     assert!(
         actual_num_packets > 0,
-        "As we wait longer than 1 minute, at least one transaction should be delivered.  \
-         After 1 minute the server is expected to accept our connection.\n\
-         Actual packets delivered: {actual_num_packets}"
+        "As we wait longer than 1 minute, at least one transaction should be delivered. After 1 \
+         minute the server is expected to accept our connection. Actual packets delivered: \
+         {actual_num_packets}"
     );
 
     // Stop the sender.
@@ -648,15 +673,13 @@ async fn test_rate_limiting_establish_connection() {
     assert!(
         stats.connection_error_timed_out > 0,
         "As the quinn timeout is below 1 minute, a few connections will fail to connect during \
-         the 1 minute delay.\n\
-         Actual connection_error_timed_out: {}",
+         the 1 minute delay. Actual connection_error_timed_out: {}",
         stats.connection_error_timed_out
     );
     assert!(
         stats.successfully_sent > 0,
         "As we run the test for longer than 1 minute, we expect a connection to be established, \
-         and a number of transactions to be delivered.\n\
-         Actual successfully_sent: {}",
+         and a number of transactions to be delivered.\nActual successfully_sent: {}",
         stats.successfully_sent
     );
 
@@ -666,7 +689,7 @@ async fn test_rate_limiting_establish_connection() {
     assert_eq!(stats, SendTransactionStatsNonAtomic::default());
 
     // Stop the server.
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
 }
 
@@ -685,21 +708,22 @@ async fn test_update_identity() {
 
     let SpawnTestServerResult {
         join_handle: server_handle,
-        exit,
         receiver,
         server_address,
         stats: _stats,
+        cancel,
     } = setup_quic_server(
         Some(staked_nodes),
-        TestServerConfig {
+        QuicStreamerConfig {
             // Must use at least the number of endpoints (10) because
             // `max_staked_connections` and `max_unstaked_connections` are
             // cumulative for all the endpoints.
             max_staked_connections: 10,
             // Deny all unstaked connections.
             max_unstaked_connections: 0,
-            ..Default::default()
+            ..QuicStreamerConfig::default_for_tests()
         },
+        SwQosConfig::default(),
     );
 
     // Setup sending txs
@@ -737,6 +761,78 @@ async fn test_update_identity() {
     assert!(stats.successfully_sent > 0);
 
     // Exit server
-    exit.store(true, Ordering::Relaxed);
+    cancel.cancel();
     server_handle.await.unwrap();
+}
+
+// Test that connection close events are detected immediately via
+// connection.closed() monitoring, not only when send operations fail.
+#[tokio::test]
+#[ignore = "Enable after we introduce TaskTracker to streamer."]
+async fn test_proactive_connection_close_detection() {
+    let SpawnTestServerResult {
+        join_handle: server_handle,
+        receiver,
+        server_address,
+        stats: _stats,
+        cancel,
+    } = setup_quic_server(
+        None,
+        QuicStreamerConfig {
+            max_connections_per_unstaked_peer: 1,
+            max_unstaked_connections: 1,
+            ..QuicStreamerConfig::default_for_tests()
+        },
+        SwQosConfig::default(),
+    );
+
+    // Setup controlled transaction sending
+    let tx_size = 1;
+    let (tx_sender, tx_receiver) = channel(10);
+
+    let (scheduler_handle, _update_identity_sender, scheduler_cancel) =
+        setup_connection_worker_scheduler(server_address, tx_receiver, None).await;
+
+    // Send first transaction to establish connection
+    tx_sender
+        .send(TransactionBatch::new(vec![vec![1u8; tx_size]]))
+        .await
+        .expect("Send first batch");
+
+    // Verify first packet received
+    let mut first_packet_received = false;
+    let start = Instant::now();
+    while !first_packet_received && start.elapsed() < Duration::from_secs(1) {
+        if let Ok(packets) = receiver.try_recv() {
+            if !packets.is_empty() {
+                first_packet_received = true;
+            }
+        } else {
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert!(first_packet_received, "First packet should be received");
+
+    // Exit server
+    cancel.cancel();
+    server_handle.await.unwrap();
+
+    tx_sender
+        .send(TransactionBatch::new(vec![vec![2u8; tx_size]]))
+        .await
+        .expect("Send second batch");
+    tx_sender
+        .send(TransactionBatch::new(vec![vec![3u8; tx_size]]))
+        .await
+        .expect("Send third batch");
+
+    // Clean up
+    scheduler_cancel.cancel();
+    let stats = join_scheduler(scheduler_handle).await;
+
+    // Verify proactive close detection
+    assert!(
+        stats.connection_error_application_closed > 0 || stats.write_error_connection_lost > 0,
+        "Should detect connection close proactively. Stats: {stats:?}"
+    );
 }

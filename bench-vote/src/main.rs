@@ -9,12 +9,19 @@ use {
     solana_hash::Hash,
     solana_keypair::Keypair,
     solana_message::Message,
-    solana_net_utils::{bind_to_unspecified, SocketConfig},
+    solana_net_utils::{
+        bind_to_unspecified,
+        sockets::{multi_bind_in_range_with_config, SocketConfiguration as SocketConfig},
+    },
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     solana_streamer::{
+        nonblocking::swqos::SwQosConfig,
         packet::PacketBatchRecycler,
-        quic::{spawn_server_multi, QuicServerParams},
+        quic::{
+            spawn_stake_wighted_qos_server, QuicStreamerConfig,
+            DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER, DEFAULT_MAX_STAKED_CONNECTIONS,
+        },
         streamer::{receiver, PacketBatchReceiver, StakedNodes, StreamerReceiveStats},
     },
     solana_transaction::Transaction,
@@ -30,12 +37,16 @@ use {
         thread::{self, spawn, JoinHandle, Result},
         time::{Duration, Instant, SystemTime},
     },
+    tokio_util::sync::CancellationToken,
 };
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 const SINK_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const SINK_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 const SOCKET_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
-const COALESCE_TIME: Option<Duration> = Some(Duration::from_millis(1));
 
 fn sink(
     exit: Arc<AtomicBool>,
@@ -45,6 +56,7 @@ fn sink(
 ) -> JoinHandle<()> {
     spawn(move || {
         let mut last_report = Instant::now();
+        let mut last_count = 0;
         while !exit.load(Ordering::Relaxed) {
             if let Ok(packet_batch) = receiver.recv_timeout(SINK_RECEIVE_TIMEOUT) {
                 received_size.fetch_add(packet_batch.len(), Ordering::Relaxed);
@@ -53,8 +65,11 @@ fn sink(
             let count = received_size.load(Ordering::Relaxed);
 
             if verbose && last_report.elapsed() > SINK_REPORT_INTERVAL {
-                println!("Received txns count: {count}");
+                let change = count - last_count;
+                let rate = change as u64 / SINK_REPORT_INTERVAL.as_secs();
+                println!("Received txns count: total: {count}, rate {rate}/s");
                 last_report = Instant::now();
+                last_count = count;
             }
         }
     })
@@ -73,7 +88,10 @@ fn main() -> Result<()> {
                 .value_name("KEYPAIR")
                 .takes_value(true)
                 .validator(is_keypair_or_ask_keyword)
-                .help("Identity keypair for the QUIC endpoint when '--use-quic' is set true. If it is not specified a dynamic key is created."),
+                .help(
+                    "Identity keypair for the QUIC endpoint. If it is not specified a random key \
+                     is created.",
+                ),
         )
         .arg(
             Arg::with_name("num-recv-sockets")
@@ -88,6 +106,36 @@ fn main() -> Result<()> {
                 .value_name("NUM")
                 .takes_value(true)
                 .help("Use this many producer threads."),
+        )
+        .arg(
+            Arg::with_name("max-connections")
+                .long("max-connections")
+                .value_name("NUM")
+                .takes_value(true)
+                .help("Maximum concurrent client connections allowed on the server side."),
+        )
+        .arg(
+            Arg::with_name("max-connections-per-peer")
+                .long("max-connections-per-peer")
+                .value_name("NUM")
+                .takes_value(true)
+                .help("Maximum concurrent client connections per peer allowed on the server side."),
+        )
+        .arg(
+            Arg::with_name("max-connections-per-ipaddr-per-min")
+                .long("max-connections-per-ipaddr-per-min")
+                .value_name("NUM")
+                .takes_value(true)
+                .help(
+                    "Maximum client connections per ipaddr per minute allowed on the server side.",
+                ),
+        )
+        .arg(
+            Arg::with_name("connection-pool-size")
+                .long("connection-pool-size")
+                .value_name("NUM")
+                .takes_value(true)
+                .help("Maximum concurrent client connections on the client side."),
         )
         .arg(
             Arg::with_name("server-only")
@@ -109,7 +157,10 @@ fn main() -> Result<()> {
                 .value_name("HOST:PORT")
                 .takes_value(true)
                 .validator(|arg| solana_net_utils::is_host_port(arg.to_string()))
-                .help("The destination streamer address to which the client will send transactions to"),
+                .help(
+                    "The destination streamer address to which the client will send transactions \
+                     to",
+                ),
         )
         .arg(
             Arg::with_name("use-connection-cache")
@@ -133,7 +184,7 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    solana_logger::setup();
+    agave_logger::setup();
 
     let mut num_sockets = 1usize;
     if let Some(n) = matches.value_of("num-recv-sockets") {
@@ -142,6 +193,16 @@ fn main() -> Result<()> {
 
     let vote_use_quic = value_t_or_exit!(matches, "use-quic", bool);
     let num_producers: u64 = value_t!(matches, "num-producers", u64).unwrap_or(4);
+
+    let max_connections: usize =
+        value_t!(matches, "max-connections", usize).unwrap_or(DEFAULT_MAX_STAKED_CONNECTIONS);
+    let max_connections_per_peer: usize = value_t!(matches, "max-connections-per-peer", usize)
+        .unwrap_or(DEFAULT_MAX_QUIC_CONNECTIONS_PER_UNSTAKED_PEER);
+    let max_connections_per_ipaddr_per_min: usize =
+        value_t!(matches, "max-connections-per-ipaddr-per-min", usize).unwrap_or(1024); // Default value for max connections per ipaddr per minute
+    let connection_pool_size: usize =
+        value_t!(matches, "connection-pool-size", usize).unwrap_or(256);
+
     let use_connection_cache = matches.is_present("use-connection-cache");
     let server_only = matches.is_present("server-only");
     let client_only = matches.is_present("client-only");
@@ -158,10 +219,12 @@ fn main() -> Result<()> {
     let ip_addr = destination.map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.ip());
 
     let quic_params = vote_use_quic.then(|| {
-        let identity_keypair = keypair_of(&matches, "identity").or_else(|| {
-            println!("--identity is not specified when --use-quic is on. Will generate a key dynamically.");
-            Some(Keypair::new())
-        }).unwrap();
+        let identity_keypair = keypair_of(&matches, "identity")
+            .or_else(|| {
+                println!("--identity is not specified, will generate a key dynamically.");
+                Some(Keypair::new())
+            })
+            .unwrap();
 
         let stake: u64 = 1024;
         let total_stake: u64 = 1024;
@@ -177,18 +240,20 @@ fn main() -> Result<()> {
 
         QuicParams {
             identity_keypair,
-            staked_nodes
+            staked_nodes,
+            connection_pool_size,
         }
     });
 
-    let (exit, read_threads, sink_threads, destination) = if !client_only {
+    let (exit, cancel, read_threads, sink_threads, destination) = if !client_only {
         let exit = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
 
         let mut read_channels = Vec::new();
         let mut read_threads = Vec::new();
         let recycler = PacketBatchRecycler::default();
-        let config = SocketConfig::default().reuseport(true);
-        let (port, read_sockets) = solana_net_utils::multi_bind_in_range_with_config(
+        let config = SocketConfig::default();
+        let (port, read_sockets) = multi_bind_in_range_with_config(
             ip_addr,
             (port, port + num_sockets as u16),
             config,
@@ -198,23 +263,29 @@ fn main() -> Result<()> {
         let stats = Arc::new(StreamerReceiveStats::new("bench-vote-test"));
 
         if let Some(quic_params) = &quic_params {
-            let quic_server_params = QuicServerParams {
-                max_connections_per_ipaddr_per_min: 1024,
-                max_connections_per_peer: 1024,
+            let quic_server_params = QuicStreamerConfig {
+                max_connections_per_ipaddr_per_min: max_connections_per_ipaddr_per_min
+                    .try_into()
+                    .unwrap(),
+                max_connections_per_unstaked_peer: max_connections_per_peer,
+                max_staked_connections: max_connections,
+                max_unstaked_connections: 0,
                 ..Default::default()
             };
+            let qos_config = SwQosConfig::default();
             let (s_reader, r_reader) = unbounded();
             read_channels.push(r_reader);
 
-            let server = spawn_server_multi(
+            let server = spawn_stake_wighted_qos_server(
                 "solRcvrBenVote",
                 "bench_vote_metrics",
                 read_sockets,
                 &quic_params.identity_keypair,
                 s_reader,
-                exit.clone(),
                 quic_params.staked_nodes.clone(),
                 quic_server_params,
+                qos_config,
+                cancel.clone(),
             )
             .unwrap();
             read_threads.push(server.thread);
@@ -231,10 +302,10 @@ fn main() -> Result<()> {
                     s_reader,
                     recycler.clone(),
                     stats.clone(),
-                    COALESCE_TIME, // coalesce
-                    true,          // use_pinned_memory
-                    None,          // in_vote_only_mode
-                    false,         // is_staked_service
+                    None,  // coalesce
+                    true,  // use_pinned_memory
+                    None,  // in_vote_only_mode
+                    false, // is_staked_service
                 ));
             }
         }
@@ -249,12 +320,13 @@ fn main() -> Result<()> {
         println!("Running server at {destination:?}");
         (
             Some(exit),
+            Some(cancel),
             Some(read_threads),
             Some(sink_threads),
             destination,
         )
     } else {
-        (None, None, None, destination.unwrap())
+        (None, None, None, None, destination.unwrap())
     };
 
     let start = SystemTime::now();
@@ -277,6 +349,7 @@ fn main() -> Result<()> {
     if !server_only {
         if let Some(exit) = exit {
             exit.store(true, Ordering::Relaxed);
+            cancel.unwrap().cancel();
         }
     } else {
         println!("To stop the server, please press ^C");
@@ -313,6 +386,7 @@ enum Transporter {
 struct QuicParams {
     identity_keypair: Keypair,
     staked_nodes: Arc<RwLock<StakedNodes>>,
+    connection_pool_size: usize,
 }
 
 fn producer(
@@ -327,7 +401,7 @@ fn producer(
         if let Some(quic_params) = &quic_params {
             Transporter::Cache(Arc::new(ConnectionCache::new_with_client_options(
                 "connection_cache_vote_quic",
-                256,  // connection_pool_size
+                quic_params.connection_pool_size,
                 None, // client_endpoint
                 Some((
                     &quic_params.identity_keypair,

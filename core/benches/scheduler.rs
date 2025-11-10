@@ -10,12 +10,8 @@ use {
         transaction_scheduler::{
             greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
             prio_graph_scheduler::{PrioGraphScheduler, PrioGraphSchedulerConfig},
-            receive_and_buffer::{
-                ReceiveAndBuffer, SanitizedTransactionReceiveAndBuffer,
-                TransactionViewReceiveAndBuffer,
-            },
+            receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
             scheduler::{PreLockFilterAction, Scheduler},
-            scheduler_metrics::{SchedulerCountMetrics, SchedulerTimingMetrics},
             transaction_state::TransactionState,
             transaction_state_container::StateContainer,
         },
@@ -133,8 +129,10 @@ fn bench_scheduler_impl<T: ReceiveAndBuffer + utils::ReceiveAndBufferCreator>(
         for (ix_count, ix_count_desc) in &ix_counts {
             for (tx_count, tx_count_desc) in &tx_counts {
                 for (conflict_type, conflict_type_desc) in &conflict_types {
-                    let bench_name =
-                    format!("{bench_name}/{scheduler_desc}/{ix_count_desc}/{tx_count_desc}/{conflict_type_desc}");
+                    let bench_name = format!(
+                        "{bench_name}/{scheduler_desc}/{ix_count_desc}/{tx_count_desc}/\
+                         {conflict_type_desc}"
+                    );
                     group.throughput(Throughput::Elements(*tx_count as u64));
                     group.bench_function(&bench_name, |bencher| {
                         bencher.iter_custom(|iters| {
@@ -199,15 +197,10 @@ fn timing_scheduler<T: ReceiveAndBuffer, S: Scheduler<T::Transaction>>(
         if sender.send(txs.clone()).is_err() {
             panic!("Unexpectedly dropped receiver!");
         }
-        let mut count_metrics = SchedulerCountMetrics::default();
-        let mut timing_metrics = SchedulerTimingMetrics::default();
-        let res = receive_and_buffer.receive_and_buffer_packets(
-            &mut container,
-            &mut timing_metrics,
-            &mut count_metrics,
-            &decision,
-        );
-        assert_eq!(res.unwrap(), num_txs);
+        let res = receive_and_buffer
+            .receive_and_buffer_packets(&mut container, &decision)
+            .unwrap();
+        assert_eq!(res.num_received, num_txs);
         assert!(!container.is_empty());
 
         let elapsed = {
@@ -221,6 +214,8 @@ fn timing_scheduler<T: ReceiveAndBuffer, S: Scheduler<T::Transaction>>(
                     scheduler
                         .schedule(
                             black_box(&mut container),
+                            u64::MAX, // no budget
+                            false,
                             bench_env.filter_1,
                             bench_env.filter_2,
                         )
@@ -236,7 +231,6 @@ fn timing_scheduler<T: ReceiveAndBuffer, S: Scheduler<T::Transaction>>(
 }
 
 fn bench_scheduler(c: &mut Criterion) {
-    bench_scheduler_impl::<SanitizedTransactionReceiveAndBuffer>(c, "sdk_transaction");
     bench_scheduler_impl::<TransactionViewReceiveAndBuffer>(c, "transaction_view");
 }
 

@@ -3,7 +3,7 @@ use {
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
     solana_vote::vote_account::VoteAccountsHashMap,
-    std::{collections::HashMap, ops::Index, sync::Arc},
+    std::{collections::HashMap, ops::Index},
 };
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -26,6 +26,7 @@ impl LeaderSchedule {
     ) -> Self {
         let keyed_stakes: Vec<_> = vote_accounts_map
             .iter()
+            .filter(|(_pubkey, (stake, _account))| *stake > 0)
             .map(|(vote_pubkey, (stake, _account))| (vote_pubkey, *stake))
             .collect();
         let vote_keyed_slot_leaders = stake_weighted_slot_leaders(keyed_stakes, epoch, len, repeat);
@@ -79,7 +80,7 @@ impl LeaderScheduleVariant for LeaderSchedule {
         self.identity_keyed_leader_schedule.get_slot_leaders()
     }
 
-    fn get_leader_slots_map(&self) -> &HashMap<Pubkey, Arc<Vec<usize>>> {
+    fn get_leader_slots_map(&self) -> &HashMap<Pubkey, Vec<usize>> {
         self.identity_keyed_leader_schedule.get_leader_slots_map()
     }
 

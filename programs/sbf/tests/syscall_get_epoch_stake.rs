@@ -7,7 +7,7 @@ use {
     solana_runtime::{
         bank::Bank,
         bank_client::BankClient,
-        epoch_stakes::EpochStakes,
+        epoch_stakes::VersionedEpochStakes,
         genesis_utils::{
             create_genesis_config_with_vote_accounts, GenesisConfigInfo, ValidatorVoteKeypairs,
         },
@@ -17,13 +17,13 @@ use {
     solana_signer::Signer,
     solana_transaction::Transaction,
     solana_vote::vote_account::VoteAccount,
-    solana_vote_program::vote_state::create_account_with_authorized,
+    solana_vote_program::vote_state::create_v4_account_with_authorized,
     std::collections::HashMap,
 };
 
 #[test]
 fn test_syscall_get_epoch_stake() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     // Two vote accounts with stake.
     let stakes = vec![100_000_000, 500_000_000];
@@ -44,16 +44,17 @@ fn test_syscall_get_epoch_stake() {
     // Intentionally overwrite the bank epoch with no stake, to ensure the
     // syscall gets the _current_ epoch stake based on the leader schedule
     // (N + 1).
-    let epoch_stakes_epoch_0 = EpochStakes::new_for_tests(
+    let epoch_stakes_epoch_0 = VersionedEpochStakes::new_for_tests(
         voting_keypairs
             .iter()
             .map(|keypair| {
                 let node_id = keypair.node_keypair.pubkey();
                 let authorized_voter = keypair.vote_keypair.pubkey();
-                let vote_account = VoteAccount::try_from(create_account_with_authorized(
+                let vote_account = VoteAccount::try_from(create_v4_account_with_authorized(
                     &node_id,
                     &authorized_voter,
                     &node_id,
+                    None,
                     0,
                     100,
                 ))

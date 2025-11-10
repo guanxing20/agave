@@ -30,9 +30,11 @@ impl<'a> AccountStorageReader<'a> {
         let num_total_bytes = storage.accounts.len();
         let num_alive_bytes = num_total_bytes - storage.get_obsolete_bytes(snapshot_slot);
 
-        let mut sorted_obsolete_accounts = storage.get_obsolete_accounts(snapshot_slot);
-
-        // Tiered storage is not compatible with obsolete acocunts at this time
+        let mut sorted_obsolete_accounts: Vec<_> = storage
+            .obsolete_accounts_read_lock()
+            .filter_obsolete_accounts(snapshot_slot)
+            .collect();
+        // Tiered storage is not compatible with obsolete accounts at this time
         if matches!(storage.accounts, AccountsFile::TieredStorage(_)) {
             assert!(
                 sorted_obsolete_accounts.is_empty(),
@@ -135,6 +137,7 @@ mod tests {
         crate::{
             accounts_db::{get_temp_accounts_paths, AccountStorageEntry},
             accounts_file::{AccountsFile, AccountsFileProvider, StorageAccess},
+            ObsoleteAccounts,
         },
         log::*,
         rand::{rngs::StdRng, seq::SliceRandom, SeedableRng},
@@ -147,21 +150,25 @@ mod tests {
     fn create_storage_for_storage_reader(
         slot: Slot,
         provider: AccountsFileProvider,
+        storage_access: StorageAccess,
     ) -> (AccountStorageEntry, Vec<tempfile::TempDir>) {
         let id = 0;
         let (temp_dirs, paths) = get_temp_accounts_paths(1).unwrap();
         let file_size = 1024 * 1024;
         (
-            AccountStorageEntry::new(&paths[0], slot, id, file_size, provider),
+            AccountStorageEntry::new(&paths[0], slot, id, file_size, provider, storage_access),
             temp_dirs,
         )
     }
 
-    #[test]
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
     #[should_panic(expected = "Obsolete accounts should be empty for TieredStorage")]
-    fn test_account_storage_reader_tiered_storage_one_obsolete_account_should_panic() {
+    fn test_account_storage_reader_tiered_storage_one_obsolete_account_should_panic(
+        storage_access: StorageAccess,
+    ) {
         let (storage, _temp_dirs) =
-            create_storage_for_storage_reader(0, AccountsFileProvider::HotStorage);
+            create_storage_for_storage_reader(0, AccountsFileProvider::HotStorage, storage_access);
 
         let account = AccountSharedData::new(1, 10, &Pubkey::new_unique());
         let account2 = AccountSharedData::new(1, 10, &Pubkey::new_unique());
@@ -172,20 +179,28 @@ mod tests {
             (&Pubkey::new_unique(), &account2),
         ];
 
-        storage.accounts.append_accounts(&(slot, &accounts[..]), 0);
+        storage.accounts.write_accounts(&(slot, &accounts[..]), 0);
 
         let offset = 0;
         // Mark the obsolete accounts in storage
         let mut size = storage.accounts.get_account_data_lens(&[0]);
-        storage.mark_account_obsolete(offset, size.pop().unwrap(), 0);
+        storage
+            .obsolete_accounts()
+            .write()
+            .unwrap()
+            .mark_accounts_obsolete(vec![(offset, size.pop().unwrap())].into_iter(), 0);
 
         _ = AccountStorageReader::new(&storage, None).unwrap();
     }
 
-    #[test_case(AccountsFileProvider::AppendVec)]
-    #[test_case(AccountsFileProvider::HotStorage)]
-    fn test_account_storage_reader_no_obsolete_accounts(provider: AccountsFileProvider) {
-        let (storage, _temp_dirs) = create_storage_for_storage_reader(0, provider);
+    #[test_case(AccountsFileProvider::AppendVec, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(AccountsFileProvider::AppendVec, StorageAccess::File)]
+    #[test_case(AccountsFileProvider::HotStorage, StorageAccess::File)]
+    fn test_account_storage_reader_no_obsolete_accounts(
+        provider: AccountsFileProvider,
+        storage_access: StorageAccess,
+    ) {
+        let (storage, _temp_dirs) = create_storage_for_storage_reader(0, provider, storage_access);
 
         let account = AccountSharedData::new(1, 10, &Pubkey::default());
         let account2 = AccountSharedData::new(1, 10, &Pubkey::default());
@@ -196,7 +211,7 @@ mod tests {
             (&Pubkey::new_unique(), &account2),
         ];
 
-        storage.accounts.append_accounts(&(slot, &accounts[..]), 0);
+        storage.accounts.write_accounts(&(slot, &accounts[..]), 0);
 
         let reader = AccountStorageReader::new(&storage, None).unwrap();
         assert_eq!(reader.len(), storage.accounts.len());
@@ -208,20 +223,20 @@ mod tests {
     #[test_case(100, 0, StorageAccess::File)]
     #[test_case(100, 10, StorageAccess::File)]
     #[test_case(100, 100, StorageAccess::File)]
-    #[test_case(0, 0, StorageAccess::Mmap)]
-    #[test_case(1, 0, StorageAccess::Mmap)]
-    #[test_case(1, 1, StorageAccess::Mmap)]
-    #[test_case(100, 0, StorageAccess::Mmap)]
-    #[test_case(100, 10, StorageAccess::Mmap)]
-    #[test_case(100, 100, StorageAccess::Mmap)]
+    #[test_case(0, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(1, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(1, 1, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 0, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 10, #[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(100, 100, #[allow(deprecated)] StorageAccess::Mmap)]
     fn test_account_storage_reader_with_obsolete_accounts(
         total_accounts: usize,
         number_of_accounts_to_remove: usize,
         storage_access: StorageAccess,
     ) {
-        solana_logger::setup();
+        agave_logger::setup();
         let (storage, _temp_dirs) =
-            create_storage_for_storage_reader(0, AccountsFileProvider::AppendVec);
+            create_storage_for_storage_reader(0, AccountsFileProvider::AppendVec, storage_access);
 
         let slot = 0;
 
@@ -238,11 +253,11 @@ mod tests {
 
         let offsets = storage
             .accounts
-            .append_accounts(&(slot, &accounts_to_append[..]), 0);
+            .write_accounts(&(slot, &accounts_to_append[..]), 0);
 
         // Generate a seed from entropy and log the original seed
         let seed: u64 = rand::random();
-        info!("Generated seed: {}", seed);
+        info!("Generated seed: {seed}");
 
         // Use a seedable RNG with the generated seed for reproducibility
         let mut rng = StdRng::seed_from_u64(seed);
@@ -260,10 +275,14 @@ mod tests {
         assert_eq!(obsolete_account_offset.len(), number_of_accounts_to_remove);
 
         // Mark the obsolete accounts in storage
-        obsolete_account_offset.into_iter().for_each(|offset| {
-            let mut size = storage.accounts.get_account_data_lens(&[offset]);
-            storage.mark_account_obsolete(offset, size.pop().unwrap(), 0);
-        });
+        let data_lens = storage
+            .accounts
+            .get_account_data_lens(&obsolete_account_offset);
+        storage
+            .obsolete_accounts()
+            .write()
+            .unwrap()
+            .mark_accounts_obsolete(obsolete_account_offset.into_iter().zip(data_lens), 0);
 
         let storage = storage
             .reopen_as_readonly(storage_access)
@@ -275,6 +294,7 @@ mod tests {
                 storage.accounts.internals_for_archive(),
                 InternalsForArchive::FileIo(_)
             )),
+            #[allow(deprecated)]
             StorageAccess::Mmap => assert!(matches!(
                 storage.accounts.internals_for_archive(),
                 InternalsForArchive::Mmap(_)
@@ -311,18 +331,23 @@ mod tests {
             );
 
             // Create a new AccountStorageEntry from the output file
-            let new_storage =
-                AccountStorageEntry::new_existing(slot, 0, accounts_file, num_accounts);
+            let new_storage = AccountStorageEntry::new_existing(
+                slot,
+                0,
+                accounts_file,
+                ObsoleteAccounts::default(),
+            );
 
             // Verify that the new storage has the same length as the reader
             assert_eq!(new_storage.accounts.len(), reader.len());
         }
     }
 
-    #[test]
-    fn test_account_storage_reader_filter_by_slot() {
+    #[test_case(#[allow(deprecated)] StorageAccess::Mmap)]
+    #[test_case(StorageAccess::File)]
+    fn test_account_storage_reader_filter_by_slot(storage_access: StorageAccess) {
         let (storage, _temp_dirs) =
-            create_storage_for_storage_reader(10, AccountsFileProvider::AppendVec);
+            create_storage_for_storage_reader(10, AccountsFileProvider::AppendVec, storage_access);
         let total_accounts = 30;
 
         let slot = 0;
@@ -340,11 +365,11 @@ mod tests {
 
         let offsets = storage
             .accounts
-            .append_accounts(&(slot, &accounts_to_append[..]), 0);
+            .write_accounts(&(slot, &accounts_to_append[..]), 0);
 
         // Generate a seed from entropy and log the original seed
         let seed: u64 = rand::random();
-        info!("Generated seed: {}", seed);
+        info!("Generated seed: {seed}");
 
         // Use a seedable RNG with the generated seed for reproducibility
         let mut rng = StdRng::seed_from_u64(seed);
@@ -376,7 +401,14 @@ mod tests {
         let mut slot_marked_dead = 0;
         obsolete_account_offset.into_iter().for_each(|offset| {
             let mut size = storage.accounts.get_account_data_lens(&[offset]);
-            storage.mark_account_obsolete(offset, size.pop().unwrap(), slot_marked_dead);
+            storage
+                .obsolete_accounts()
+                .write()
+                .unwrap()
+                .mark_accounts_obsolete(
+                    vec![(offset, size.pop().unwrap())].into_iter(),
+                    slot_marked_dead,
+                );
             slot_marked_dead += 1;
         });
 
@@ -401,13 +433,17 @@ mod tests {
             // Close the file
             drop(output_file);
 
-            let (accounts_file, num_accounts) =
+            let (accounts_file, _num_accounts) =
                 AccountsFile::new_from_file(temp_file_path, current_len, StorageAccess::File)
                     .unwrap();
 
             // Create a new AccountStorageEntry from the output file
-            let new_storage =
-                AccountStorageEntry::new_existing(slot, 0, accounts_file, num_accounts);
+            let new_storage = AccountStorageEntry::new_existing(
+                slot,
+                0,
+                accounts_file,
+                ObsoleteAccounts::default(),
+            );
 
             // Verify that the new storage has the same length as the reader
             assert_eq!(new_storage.accounts.len(), reader.len());

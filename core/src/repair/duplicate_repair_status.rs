@@ -322,9 +322,9 @@ impl AncestorRequestStatus {
                             agreed_response[*mismatch_i];
                         let mismatch_our_frozen_hash = blockstore.get_bank_hash(mismatch_slot);
                         info!(
-                            "When processing the ancestor sample for {}, there was a mismatch \
-                             for {mismatch_slot}: we had frozen hash {:?} and the cluster agreed \
-                             upon {mismatch_agreed_upon_hash}. However for a later ancestor \
+                            "When processing the ancestor sample for {}, there was a mismatch for \
+                             {mismatch_slot}: we had frozen hash {:?} and the cluster agreed upon \
+                             {mismatch_agreed_upon_hash}. However for a later ancestor \
                              {ancestor_slot} we have agreement on {our_frozen_hash} as the bank \
                              hash. This should never be possible, something is wrong or the \
                              cluster sample is invalid. Rejecting and queuing the ancestor hashes \
@@ -360,10 +360,9 @@ impl AncestorRequestStatus {
                             self.requested_mismatched_slot
                         );
                     }
-                    (Some(decision), true) => panic!(
-                        "Programmer error, {:?} should not be set in decision loop",
-                        decision
-                    ),
+                    (Some(decision), true) => {
+                        panic!("Programmer error, {decision:?} should not be set in decision loop")
+                    }
                     (Some(_), false) => { /* Already found a mismatch, descendants continue to mismatch as well */
                     }
                     (None, true) => { /* Mismatch hasn't been found yet */ }
@@ -476,9 +475,9 @@ impl AncestorRequestStatus {
                 // replay dump then repair to fix.
 
                 warn!(
-                    "Blockstore is missing frozen hash for slot {ancestor_slot}, \
-                     which the cluster claims is an ancestor of dead slot {}. Potentially \
-                     our version of the dead slot chains to the wrong fork!",
+                    "Blockstore is missing frozen hash for slot {ancestor_slot}, which the \
+                     cluster claims is an ancestor of dead slot {}. Potentially our version of \
+                     the dead slot chains to the wrong fork!",
                     self.requested_mismatched_slot
                 );
             }
@@ -1131,7 +1130,7 @@ pub mod tests {
         let tree = test_setup
             .correct_ancestors_response
             .iter()
-            .fold(tr(request_slot + 1), |tree, (slot, _)| (tr(*slot) / tree));
+            .fold(tr(request_slot + 1), |tree, (slot, _)| tr(*slot) / tree);
         test_setup
             .blockstore
             .add_tree(tree, true, true, 2, Hash::default());
@@ -1166,7 +1165,7 @@ pub mod tests {
             .correct_ancestors_response
             .iter()
             .filter(|(slot, _)| *slot <= 92 || *slot % 2 == 1)
-            .fold(tr(request_slot), |tree, (slot, _)| (tr(*slot) / tree));
+            .fold(tr(request_slot), |tree, (slot, _)| tr(*slot) / tree);
         test_setup
             .blockstore
             .add_tree(tree, true, true, 2, Hash::default());
@@ -1211,7 +1210,7 @@ pub mod tests {
         let pruned_fork = [10, 11, 93, 94, 95, 96, 97, 98, 99]
             .iter()
             .rev()
-            .fold(tr(100), |tree, slot| (tr(*slot) / tree));
+            .fold(tr(100), |tree, slot| tr(*slot) / tree);
 
         test_setup
             .blockstore

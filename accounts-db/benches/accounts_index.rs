@@ -8,13 +8,17 @@ use {
     solana_accounts_db::{
         account_info::AccountInfo,
         accounts_index::{
-            AccountSecondaryIndexes, AccountsIndex, UpsertReclaim,
+            AccountSecondaryIndexes, AccountsIndex, ReclaimsSlotList, UpsertReclaim,
             ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS,
         },
     },
     std::sync::Arc,
     test::Bencher,
 };
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[bench]
 fn bench_accounts_index(bencher: &mut Bencher) {
@@ -25,7 +29,7 @@ fn bench_accounts_index(bencher: &mut Bencher) {
 
     const NUM_FORKS: u64 = 16;
 
-    let mut reclaims = vec![];
+    let mut reclaims = ReclaimsSlotList::new();
     let index = AccountsIndex::<AccountInfo, AccountInfo>::new(
         &ACCOUNTS_INDEX_CONFIG_FOR_BENCHMARKS,
         Arc::default(),

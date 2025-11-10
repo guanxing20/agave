@@ -9,6 +9,10 @@ use {
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
     },
+    agave_snapshots::{
+        paths as snapshot_paths, snapshot_archive_info::SnapshotArchiveInfoGetter,
+        snapshot_config::SnapshotConfig, SnapshotInterval,
+    },
     crossbeam_channel::unbounded,
     jsonrpc_core::{futures::prelude::*, MetaIoHandler},
     jsonrpc_http_server::{
@@ -16,18 +20,20 @@ use {
         RequestMiddlewareAction, ServerBuilder,
     },
     regex::Regex,
-    solana_client::connection_cache::{ConnectionCache, Protocol},
+    solana_cli_output::display::build_balance_message,
+    solana_client::{
+        client_option::ClientOption,
+        connection_cache::{ConnectionCache, Protocol},
+    },
     solana_genesis_config::DEFAULT_GENESIS_DOWNLOAD_PATH,
     solana_gossip::cluster_info::ClusterInfo,
     solana_hash::Hash,
-    solana_keypair::Keypair,
     solana_ledger::{
         bigtable_upload::ConfirmedBlockUploadConfig,
         bigtable_upload_service::BigTableUploadService, blockstore::Blockstore,
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_metrics::inc_new_counter_info,
-    solana_native_token::lamports_to_sol,
     solana_perf::thread::renice_this_thread,
     solana_poh::poh_recorder::PohRecorder,
     solana_quic_definitions::NotifyKeyUpdate,
@@ -35,9 +41,6 @@ use {
         bank::Bank, bank_forks::BankForks, commitment::BlockCommitmentCache,
         non_circulating_supply::calculate_non_circulating_supply,
         prioritization_fee_cache::PrioritizationFeeCache,
-        snapshot_archive_info::SnapshotArchiveInfoGetter,
-        snapshot_bank_utils::DISABLED_SNAPSHOT_ARCHIVE_INTERVAL, snapshot_config::SnapshotConfig,
-        snapshot_utils,
     },
     solana_send_transaction_service::{
         send_transaction_service::{self, SendTransactionService},
@@ -46,7 +49,7 @@ use {
     solana_storage_bigtable::CredentialType,
     solana_validator_exit::Exit,
     std::{
-        net::{SocketAddr, UdpSocket},
+        net::SocketAddr,
         path::{Path, PathBuf},
         pin::Pin,
         sync::{
@@ -57,11 +60,10 @@ use {
         thread::{self, Builder, JoinHandle},
         time::{Duration, Instant},
     },
-    tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
+    tokio::runtime::{Builder as TokioBuilder, Runtime as TokioRuntime},
     tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
-        sync::CancellationToken,
     },
 };
 
@@ -141,11 +143,11 @@ impl RpcRequestMiddleware {
         Self {
             ledger_path,
             full_snapshot_archive_path_regex: Regex::new(
-                snapshot_utils::FULL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
+                snapshot_paths::FULL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
             )
             .unwrap(),
             incremental_snapshot_archive_path_regex: Regex::new(
-                snapshot_utils::INCREMENTAL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
+                snapshot_paths::INCREMENTAL_SNAPSHOT_ARCHIVE_FILENAME_REGEX,
             )
             .unwrap(),
             snapshot_config,
@@ -239,7 +241,7 @@ impl RpcRequestMiddleware {
             local_path
         } else {
             // remote snapshot archive path
-            snapshot_utils::build_snapshot_archives_remote_dir(root).join(stem)
+            snapshot_paths::build_snapshot_archives_remote_dir(root).join(stem)
         };
         (
             path,
@@ -270,7 +272,7 @@ impl RpcRequestMiddleware {
             .map(|m| m.len())
             .unwrap_or(0)
             .to_string();
-        info!("get {} -> {:?} ({} bytes)", path, filename, file_length);
+        info!("get {path} -> {filename:?} ({file_length} bytes)");
 
         if cfg!(not(test)) {
             assert!(
@@ -280,14 +282,17 @@ impl RpcRequestMiddleware {
         }
         let snapshot_timeout = self.snapshot_config.as_ref().and_then(|config| {
             snapshot_type.map(|st| {
-                let slots = match st {
-                    SnapshotKind::Full => config.full_snapshot_archive_interval_slots,
-                    SnapshotKind::Incremental => config.incremental_snapshot_archive_interval_slots,
+                let interval = match st {
+                    SnapshotKind::Full => config.full_snapshot_archive_interval,
+                    SnapshotKind::Incremental => config.incremental_snapshot_archive_interval,
                 };
-                let computed = if slots == DISABLED_SNAPSHOT_ARCHIVE_INTERVAL {
-                    Duration::ZERO
-                } else {
-                    Duration::from_millis(slots.saturating_mul(solana_clock::DEFAULT_MS_PER_SLOT))
+                let computed = match interval {
+                    SnapshotInterval::Disabled => Duration::ZERO,
+                    SnapshotInterval::Slots(slots) => Duration::from_millis(
+                        slots
+                            .get()
+                            .saturating_mul(solana_clock::DEFAULT_MS_PER_SLOT),
+                    ),
                 };
                 let fallback = match st {
                     SnapshotKind::Full => FALLBACK_FULL_SNAPSHOT_TIMEOUT_SECS,
@@ -330,7 +335,7 @@ impl RpcRequestMiddleware {
             RpcHealthStatus::Behind { .. } => "behind",
             RpcHealthStatus::Unknown => "unknown",
         };
-        info!("health check: {}", response);
+        info!("health check: {response}");
         response
     }
 }
@@ -345,7 +350,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
             {
                 // Convenience redirect to the latest snapshot
                 let full_snapshot_archive_info =
-                    snapshot_utils::get_highest_full_snapshot_archive_info(
+                    snapshot_paths::get_highest_full_snapshot_archive_info(
                         &snapshot_config.full_snapshot_archives_dir,
                     );
                 let snapshot_archive_info =
@@ -353,7 +358,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
                         if request.uri().path() == FULL_SNAPSHOT_REQUEST_PATH {
                             Some(full_snapshot_archive_info.snapshot_archive_info().clone())
                         } else {
-                            snapshot_utils::get_highest_incremental_snapshot_archive_info(
+                            snapshot_paths::get_highest_incremental_snapshot_archive_info(
                                 &snapshot_config.incremental_snapshot_archives_dir,
                                 full_snapshot_archive_info.slot(),
                             )
@@ -429,14 +434,14 @@ async fn handle_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> Option<
             let bank = bank_forks.read().unwrap().root_bank();
             let supply_result = calculate_circulating_supply_async(&bank).await;
             match supply_result {
-                Ok(supply) => Some(format!("{}", lamports_to_sol(supply))),
+                Ok(supply) => Some(build_balance_message(supply, false, false)),
                 Err(_) => None,
             }
         }
         "/v0/total-supply" => {
             let bank = bank_forks.read().unwrap().root_bank();
             let total_supply = bank.capitalization();
-            Some(format!("{}", lamports_to_sol(total_supply)))
+            Some(build_balance_message(total_supply, false, false))
         }
         _ => None,
     }
@@ -478,26 +483,13 @@ pub struct JsonRpcServiceConfig<'a> {
     pub validator_exit: Arc<RwLock<Exit>>,
     pub exit: Arc<AtomicBool>,
     pub override_health_check: Arc<AtomicBool>,
-    pub startup_verification_complete: Arc<AtomicBool>,
     pub optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     pub send_transaction_service_config: send_transaction_service::Config,
     pub max_slots: Arc<MaxSlots>,
     pub leader_schedule_cache: Arc<LeaderScheduleCache>,
     pub max_complete_transaction_status_slot: Arc<AtomicU64>,
-    pub max_complete_rewards_slot: Arc<AtomicU64>,
     pub prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     pub client_option: ClientOption<'a>,
-}
-
-/// [`ClientOption`] enum represents the available client types for TPU
-/// communication:
-/// * [`ConnectionCacheClient`]: Uses a shared [`ConnectionCache`] to manage
-///   connections efficiently.
-/// * [`TpuClientNextClient`]: Relies on the `tpu-client-next` crate and
-///   requires a reference to a [`Keypair`].
-pub enum ClientOption<'a> {
-    ConnectionCache(Arc<ConnectionCache>),
-    TpuClientNext(&'a Keypair, UdpSocket, RuntimeHandle, CancellationToken),
 }
 
 impl JsonRpcService {
@@ -541,14 +533,12 @@ impl JsonRpcService {
                     config.validator_exit,
                     config.exit,
                     config.override_health_check,
-                    config.startup_verification_complete,
                     config.optimistically_confirmed_bank,
                     config.send_transaction_service_config,
                     config.max_slots,
                     config.leader_schedule_cache,
                     client.clone(),
                     config.max_complete_transaction_status_slot,
-                    config.max_complete_rewards_slot,
                     config.prioritization_fee_cache,
                     runtime,
                 )?;
@@ -592,14 +582,12 @@ impl JsonRpcService {
                     config.validator_exit,
                     config.exit,
                     config.override_health_check,
-                    config.startup_verification_complete,
                     config.optimistically_confirmed_bank,
                     config.send_transaction_service_config,
                     config.max_slots,
                     config.leader_schedule_cache,
                     client,
                     config.max_complete_transaction_status_slot,
-                    config.max_complete_rewards_slot,
                     config.prioritization_fee_cache,
                     runtime,
                 )?;
@@ -623,14 +611,12 @@ impl JsonRpcService {
         validator_exit: Arc<RwLock<Exit>>,
         exit: Arc<AtomicBool>,
         override_health_check: Arc<AtomicBool>,
-        startup_verification_complete: Arc<AtomicBool>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         send_transaction_service_config: send_transaction_service::Config,
         max_slots: Arc<MaxSlots>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         connection_cache: Arc<ConnectionCache>,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
     ) -> Result<Self, String> {
         let runtime = service_runtime(
@@ -671,14 +657,12 @@ impl JsonRpcService {
             validator_exit,
             exit,
             override_health_check,
-            startup_verification_complete,
             optimistically_confirmed_bank,
             send_transaction_service_config,
             max_slots,
             leader_schedule_cache,
             client.clone(),
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             prioritization_fee_cache,
             runtime,
         )?;
@@ -706,19 +690,17 @@ impl JsonRpcService {
         validator_exit: Arc<RwLock<Exit>>,
         exit: Arc<AtomicBool>,
         override_health_check: Arc<AtomicBool>,
-        startup_verification_complete: Arc<AtomicBool>,
         optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
         send_transaction_service_config: send_transaction_service::Config,
         max_slots: Arc<MaxSlots>,
         leader_schedule_cache: Arc<LeaderScheduleCache>,
         client: Client,
         max_complete_transaction_status_slot: Arc<AtomicU64>,
-        max_complete_rewards_slot: Arc<AtomicU64>,
         prioritization_fee_cache: Arc<PrioritizationFeeCache>,
         runtime: Arc<TokioRuntime>,
     ) -> Result<Self, String> {
-        info!("rpc bound to {:?}", rpc_addr);
-        info!("rpc configuration: {:?}", config);
+        info!("rpc bound to {rpc_addr:?}");
+        info!("rpc configuration: {config:?}");
         let rpc_niceness_adj = config.rpc_niceness_adj;
 
         let health = Arc::new(RpcHealth::new(
@@ -726,7 +708,6 @@ impl JsonRpcService {
             Arc::clone(&blockstore),
             config.health_check_slot_distance,
             override_health_check,
-            startup_verification_complete,
         ));
 
         let largest_accounts_cache = Arc::new(RwLock::new(LargestAccountsCache::new(
@@ -766,7 +747,6 @@ impl JsonRpcService {
                                 blockstore.clone(),
                                 block_commitment_cache.clone(),
                                 max_complete_transaction_status_slot.clone(),
-                                max_complete_rewards_slot.clone(),
                                 ConfirmedBlockUploadConfig::default(),
                                 exit_bigtable_ledger_upload_service.clone(),
                             )))
@@ -780,7 +760,7 @@ impl JsonRpcService {
                         )
                     })
                     .unwrap_or_else(|err| {
-                        error!("Failed to initialize BigTable ledger storage: {:?}", err);
+                        error!("Failed to initialize BigTable ledger storage: {err:?}");
                         (None, None)
                     })
             } else {
@@ -807,7 +787,6 @@ impl JsonRpcService {
             max_slots,
             leader_schedule_cache,
             max_complete_transaction_status_slot,
-            max_complete_rewards_slot,
             prioritization_fee_cache,
             Arc::clone(&runtime),
         );
@@ -870,9 +849,8 @@ impl JsonRpcService {
 
                 if let Err(e) = server {
                     warn!(
-                        "JSON RPC service unavailable error: {:?}. \n\
-                           Also, check that port {} is not already in use by another application",
-                        e,
+                        "JSON RPC service unavailable error: {e:?}. Also, check that port {} is \
+                         not already in use by another application",
                         rpc_addr.port()
                     );
                     close_handle_sender.send(Err(e.to_string())).unwrap();
@@ -960,7 +938,8 @@ mod tests {
     use {
         super::*,
         crate::rpc::{create_validator_exit, tests::new_test_cluster_info},
-        solana_genesis_config::{ClusterType, DEFAULT_GENESIS_ARCHIVE},
+        solana_cluster_type::ClusterType,
+        solana_genesis_config::DEFAULT_GENESIS_ARCHIVE,
         solana_ledger::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
             get_tmp_ledger_path_auto_delete,
@@ -987,9 +966,10 @@ mod tests {
         let bank = Bank::new_for_tests(&genesis_config);
         let cluster_info = Arc::new(new_test_cluster_info());
         let ip_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let port_range = solana_net_utils::sockets::localhost_port_range_for_tests();
         let rpc_addr = SocketAddr::new(
             ip_addr,
-            solana_net_utils::find_available_port_in_range(ip_addr, (10000, 65535)).unwrap(),
+            solana_net_utils::find_available_port_in_range(ip_addr, port_range).unwrap(),
         );
         let bank_forks = BankForks::new_rw_arc(bank);
         let ledger_path = get_tmp_ledger_path_auto_delete!();
@@ -1012,7 +992,6 @@ mod tests {
             validator_exit,
             exit,
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(true)),
             optimistically_confirmed_bank,
             send_transaction_service::Config {
                 retry_rate_ms: 1000,
@@ -1022,7 +1001,6 @@ mod tests {
             Arc::new(MaxSlots::default()),
             Arc::new(LeaderScheduleCache::default()),
             connection_cache,
-            Arc::new(AtomicU64::default()),
             Arc::new(AtomicU64::default()),
             Arc::new(PrioritizationFeeCache::default()),
         )
@@ -1137,49 +1115,57 @@ mod tests {
         assert!(!rrm.is_file_get_path("/incremental-snapshot.tar.bz2"));
 
         assert!(!rrm.is_file_get_path(
-            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(!rrm.is_file_get_path(
-            "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+            "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
 
-        assert!(rrm_with_snapshot_config.is_file_get_path(
-            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
-        ));
         assert!(rrm_with_snapshot_config.is_file_get_path(
             "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
-        assert!(rrm_with_snapshot_config
+        assert!(rrm_with_snapshot_config.is_file_get_path(
+            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.lz4"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+        ));
+        assert!(!rrm_with_snapshot_config
             .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.gz"));
-        assert!(rrm_with_snapshot_config
+        assert!(!rrm_with_snapshot_config
             .is_file_get_path("/snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
 
-        assert!(rrm_with_snapshot_config.is_file_get_path(
-            "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
-        ));
         assert!(rrm_with_snapshot_config.is_file_get_path(
             "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(rrm_with_snapshot_config.is_file_get_path(
+            "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.lz4"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
             "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.gz"
         ));
-        assert!(rrm_with_snapshot_config.is_file_get_path(
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
             "/incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
         ));
 
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "/snapshot-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+            "/snapshot-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "/incremental-snapshot-notaslotnumber-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+            "/incremental-snapshot-notaslotnumber-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "/incremental-snapshot-100-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.bz2"
+            "/incremental-snapshot-100-notaslotnumber-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
 
-        assert!(!rrm_with_snapshot_config.is_file_get_path("../../../test/snapshot-123-xxx.tar"));
+        assert!(
+            !rrm_with_snapshot_config.is_file_get_path("../../../test/snapshot-123-xxx.tar.zst")
+        );
         assert!(!rrm_with_snapshot_config
-            .is_file_get_path("../../../test/incremental-snapshot-123-456-xxx.tar"));
+            .is_file_get_path("../../../test/incremental-snapshot-123-456-xxx.tar.zst"));
 
         assert!(!rrm.is_file_get_path("/"));
         assert!(!rrm.is_file_get_path("//"));
@@ -1195,20 +1181,23 @@ mod tests {
         assert!(!rrm.is_file_get_path("..//"));
         assert!(!rrm.is_file_get_path("🎣"));
 
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("//snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("/./snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
-        assert!(!rrm_with_snapshot_config
-            .is_file_get_path("/../snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"));
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "//incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+            "//snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "/./incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+            "/./snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
         assert!(!rrm_with_snapshot_config.is_file_get_path(
-            "/../incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar"
+            "/../snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "//incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/./incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
+        ));
+        assert!(!rrm_with_snapshot_config.is_file_get_path(
+            "/../incremental-snapshot-100-200-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst"
         ));
     }
 

@@ -10,7 +10,7 @@ use {
     solana_commitment_config::CommitmentConfig,
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_net_utils::bind_to_unspecified,
+    solana_net_utils::sockets::bind_to_localhost_unique,
     solana_pubkey::Pubkey,
     solana_pubsub_client::nonblocking::pubsub_client::PubsubClient,
     solana_rent::Rent,
@@ -65,7 +65,7 @@ fn post_rpc(request: Value, rpc_url: &str) -> Value {
 
 #[test]
 fn test_rpc_send_tx() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
@@ -83,7 +83,7 @@ fn test_rpc_send_tx() {
         .parse()
         .unwrap();
 
-    info!("blockhash: {:?}", blockhash);
+    info!("blockhash: {blockhash:?}");
     let tx = system_transaction::transfer(
         &alice,
         &bob_pubkey,
@@ -138,7 +138,7 @@ fn test_rpc_send_tx() {
 
 #[test]
 fn test_simulation_replaced_blockhash() -> ClientResult<()> {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let validator = TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
@@ -183,7 +183,7 @@ fn test_simulation_replaced_blockhash() -> ClientResult<()> {
 
 #[test]
 fn test_rpc_invalid_requests() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
@@ -216,7 +216,7 @@ fn test_rpc_invalid_requests() {
 
 #[test]
 fn test_rpc_slot_updates() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let test_validator =
         TestValidator::with_no_fees(Pubkey::new_unique(), None, SocketAddrSpace::Unspecified);
@@ -284,13 +284,13 @@ fn test_rpc_slot_updates() {
 
 #[test]
 fn test_rpc_subscriptions() {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let test_validator =
         TestValidator::with_no_fees_udp(alice.pubkey(), None, SocketAddrSpace::Unspecified);
 
-    let transactions_socket = bind_to_unspecified().unwrap();
+    let transactions_socket = bind_to_localhost_unique().unwrap();
     transactions_socket.connect(test_validator.tpu()).unwrap();
 
     let rpc_client = RpcClient::new(test_validator.rpc_url());
@@ -442,7 +442,7 @@ fn test_rpc_subscriptions() {
         sleep(Duration::from_millis(100));
     }
     if mint_balance != expected_mint_balance {
-        error!("mint-check timeout. mint_balance {:?}", mint_balance);
+        error!("mint-check timeout. mint_balance {mint_balance:?}");
     }
 
     // Wait for all signature subscriptions
@@ -503,7 +503,10 @@ fn run_tpu_send_transaction(tpu_use_quic: bool) {
         CommitmentConfig::processed(),
     ));
     let connection_cache = if tpu_use_quic {
-        ConnectionCache::new_quic("connection_cache_test", DEFAULT_TPU_CONNECTION_POOL_SIZE)
+        ConnectionCache::new_quic_for_tests(
+            "connection_cache_test",
+            DEFAULT_TPU_CONNECTION_POOL_SIZE,
+        )
     } else {
         ConnectionCache::with_udp("connection_cache_test", DEFAULT_TPU_CONNECTION_POOL_SIZE)
     };
@@ -553,7 +556,7 @@ fn test_tpu_send_transaction_with_quic() {
 
 #[test]
 fn deserialize_rpc_error() -> ClientResult<()> {
-    solana_logger::setup();
+    agave_logger::setup();
 
     let alice = Keypair::new();
     let validator = TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);

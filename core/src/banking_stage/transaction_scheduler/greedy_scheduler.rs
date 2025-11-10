@@ -4,11 +4,9 @@ use {
     super::{
         scheduler::{PreLockFilterAction, Scheduler, SchedulingSummary},
         scheduler_common::{
-            select_thread, Batches, SchedulingCommon, TransactionSchedulingError,
-            TransactionSchedulingInfo,
+            select_thread, SchedulingCommon, TransactionSchedulingError, TransactionSchedulingInfo,
         },
         scheduler_error::SchedulerError,
-        thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError},
         transaction_priority_id::TransactionPriorityId,
         transaction_state::TransactionState,
         transaction_state_container::StateContainer,
@@ -17,6 +15,9 @@ use {
         consumer::TARGET_NUM_TRANSACTIONS_PER_BATCH,
         read_write_account_set::ReadWriteAccountSet,
         scheduler_messages::{ConsumeWork, FinishedConsumeWork},
+    },
+    agave_scheduling_utils::thread_aware_account_locks::{
+        ThreadAwareAccountLocks, ThreadId, ThreadSet, TryLockError,
     },
     crossbeam_channel::{Receiver, Sender},
     solana_cost_model::block_cost_limits::MAX_BLOCK_UNITS,
@@ -59,9 +60,13 @@ impl<Tx: TransactionWithMeta> GreedyScheduler<Tx> {
         config: GreedySchedulerConfig,
     ) -> Self {
         Self {
-            common: SchedulingCommon::new(consume_work_senders, finished_consume_work_receiver),
             working_account_set: ReadWriteAccountSet::default(),
             unschedulables: Vec::with_capacity(config.max_scanned_transactions_per_scheduling_pass),
+            common: SchedulingCommon::new(
+                consume_work_senders,
+                finished_consume_work_receiver,
+                config.target_transactions_per_batch,
+            ),
             config,
         }
     }
@@ -71,9 +76,20 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
     fn schedule<S: StateContainer<Tx>>(
         &mut self,
         container: &mut S,
+        budget: u64,
+        relax_intrabatch_account_locks: bool,
         _pre_graph_filter: impl Fn(&[&Tx], &mut [bool]),
         pre_lock_filter: impl Fn(&TransactionState<Tx>) -> PreLockFilterAction,
     ) -> Result<SchedulingSummary, SchedulerError> {
+        // Subtract any in-flight compute units from the budget.
+        let mut budget = budget.saturating_sub(
+            self.common
+                .in_flight_tracker
+                .cus_in_flight_per_thread()
+                .iter()
+                .sum(),
+        );
+
         let starting_queue_size = container.queue_size();
         let starting_buffer_size = container.buffer_size();
 
@@ -96,6 +112,12 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
             });
         }
 
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.common.batches.is_empty(),
+            "batches must start empty for scheduling"
+        );
+
         // Track metrics on filter.
         let mut num_scanned: usize = 0;
         let mut num_scheduled = Saturating::<usize>(0);
@@ -103,8 +125,8 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         let mut num_unschedulable_conflicts: usize = 0;
         let mut num_unschedulable_threads: usize = 0;
 
-        let mut batches = Batches::new(num_threads, self.config.target_transactions_per_batch);
-        while num_scanned < self.config.max_scanned_transactions_per_scheduling_pass
+        while budget > 0
+            && num_scanned < self.config.max_scanned_transactions_per_scheduling_pass
             && !schedulable_threads.is_empty()
             && !container.is_empty()
         {
@@ -122,14 +144,13 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
 
             // If there is a conflict with any of the transactions in the current batches,
             // we should immediately send out the batches, so this transaction may be scheduled.
-            if !self
-                .working_account_set
-                .check_locks(transaction_state.transaction())
+            if !relax_intrabatch_account_locks
+                && !self
+                    .working_account_set
+                    .check_locks(transaction_state.transaction())
             {
                 self.working_account_set.clear();
-                num_sent += self
-                    .common
-                    .send_batches(&mut batches, self.config.target_transactions_per_batch)?;
+                num_sent += self.common.send_batches()?;
             }
 
             // Now check if the transaction can actually be scheduled.
@@ -141,9 +162,9 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                 |thread_set| {
                     select_thread(
                         thread_set,
-                        batches.total_cus(),
+                        self.common.batches.total_cus(),
                         self.common.in_flight_tracker.cus_in_flight_per_thread(),
-                        batches.transactions(),
+                        self.common.batches.transactions(),
                         self.common.in_flight_tracker.num_in_flight_per_thread(),
                     )
                 },
@@ -162,28 +183,34 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
                     max_age,
                     cost,
                 }) => {
-                    assert!(
-                        self.working_account_set.take_locks(&transaction),
-                        "locks must be available"
-                    );
+                    if !relax_intrabatch_account_locks {
+                        assert!(
+                            self.working_account_set.take_locks(&transaction),
+                            "locks must be available"
+                        );
+                    }
                     num_scheduled += 1;
-                    batches.add_transaction_to_batch(thread_id, id.id, transaction, max_age, cost);
+                    self.common.batches.add_transaction_to_batch(
+                        thread_id,
+                        id.id,
+                        transaction,
+                        max_age,
+                        cost,
+                    );
+                    budget = budget.saturating_sub(cost);
 
                     // If target batch size is reached, send all the batches
-                    if batches.transactions()[thread_id].len()
+                    if self.common.batches.transactions()[thread_id].len()
                         >= self.config.target_transactions_per_batch
                     {
                         self.working_account_set.clear();
-                        num_sent += self.common.send_batches(
-                            &mut batches,
-                            self.config.target_transactions_per_batch,
-                        )?;
+                        num_sent += self.common.send_batches()?;
                     }
 
                     // if the thread is at target_cu_per_thread, remove it from the schedulable threads
                     // if there are no more schedulable threads, stop scheduling.
                     if self.common.in_flight_tracker.cus_in_flight_per_thread()[thread_id]
-                        + batches.total_cus()[thread_id]
+                        + self.common.batches.total_cus()[thread_id]
                         >= target_cu_per_thread
                     {
                         schedulable_threads.remove(thread_id);
@@ -196,8 +223,7 @@ impl<Tx: TransactionWithMeta> Scheduler<Tx> for GreedyScheduler<Tx> {
         }
 
         self.working_account_set.clear();
-        // Use zero here to avoid allocating since we are done with `Batches`.
-        num_sent += self.common.send_batches(&mut batches, 0)?;
+        num_sent += self.common.send_batches()?;
         let Saturating(num_scheduled) = num_scheduled;
         assert_eq!(
             num_scheduled, num_sent,
@@ -282,16 +308,17 @@ mod test {
         },
         crossbeam_channel::unbounded,
         itertools::Itertools,
-        solana_pubkey::Pubkey,
-        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_compute_budget_interface::ComputeBudgetInstruction,
         solana_hash::Hash,
-        solana_message::Message,
         solana_keypair::Keypair,
+        solana_message::Message,
+        solana_pubkey::Pubkey,
+        solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_signer::Signer,
         solana_system_interface::instruction as system_instruction,
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         std::borrow::Borrow,
+        test_case::test_case,
     };
 
     #[allow(clippy::type_complexity)]
@@ -401,7 +428,13 @@ mod test {
 
         drop(work_receivers); // explicitly drop receivers
         assert_matches!(
-            scheduler.schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter),
+            scheduler.schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter
+            ),
             Err(SchedulerError::DisconnectedSendChannel(_))
         );
     }
@@ -416,11 +449,39 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
         assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![1, 0]]);
+    }
+
+    #[test]
+    fn test_schedule_budget() {
+        let (mut scheduler, _work_receivers, _finished_work_sender) =
+            create_test_frame(1, GreedySchedulerConfig::default());
+        let mut container = create_container([
+            (&Keypair::new(), &[Pubkey::new_unique()], 1, 1),
+            (&Keypair::new(), &[Pubkey::new_unique()], 2, 2),
+        ]);
+
+        let scheduling_summary = scheduler
+            .schedule(
+                &mut container,
+                0, // zero budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
+            .unwrap();
+        assert_eq!(scheduling_summary.num_scheduled, 0);
+        assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
     }
 
     #[test]
@@ -438,7 +499,13 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -460,7 +527,13 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 1);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -482,15 +555,22 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
         assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![1], vec![0]]);
     }
 
-    #[test]
-    fn test_schedule_single_threaded_conflict() {
+    #[test_case(true; "relax_intrabatch_account_locks_true")]
+    #[test_case(false; "relax_intrabatch_account_locks_false")]
+    fn test_schedule_single_threaded_conflict(relax_intrabatch_account_locks: bool) {
         let (mut scheduler, work_receivers, _finished_work_sender) =
             create_test_frame(1, GreedySchedulerConfig::default());
         let pubkey = Pubkey::new_unique();
@@ -500,11 +580,21 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                relax_intrabatch_account_locks,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 2);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
-        assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![1], vec![0]]);
+        if relax_intrabatch_account_locks {
+            assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![1, 0]]);
+        } else {
+            assert_eq!(collect_work(&work_receivers[0]).1, vec![vec![1], vec![0]]);
+        }
     }
 
     #[test]
@@ -515,7 +605,13 @@ mod test {
             create_container((0..4).map(|i| (Keypair::new(), [Pubkey::new_unique()], 1, i)));
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 4);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 0);
@@ -551,7 +647,13 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_conflicts, 1);
@@ -583,7 +685,13 @@ mod test {
         ]);
 
         let scheduling_summary = scheduler
-            .schedule(&mut container, test_pre_graph_filter, test_pre_lock_filter)
+            .schedule(
+                &mut container,
+                u64::MAX, // no budget
+                false,
+                test_pre_graph_filter,
+                test_pre_lock_filter,
+            )
             .unwrap();
         assert_eq!(scheduling_summary.num_scheduled, 3);
         assert_eq!(scheduling_summary.num_unschedulable_threads, 3);

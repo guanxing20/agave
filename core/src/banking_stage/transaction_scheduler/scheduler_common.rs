@@ -2,16 +2,14 @@
 use qualifier_attr::qualifiers;
 use {
     super::{
-        in_flight_tracker::InFlightTracker,
-        scheduler_error::SchedulerError,
-        thread_aware_account_locks::{ThreadAwareAccountLocks, ThreadId, ThreadSet},
+        in_flight_tracker::InFlightTracker, scheduler_error::SchedulerError,
         transaction_state_container::StateContainer,
     },
-    crate::banking_stage::{
-        scheduler_messages::{
-            ConsumeWork, FinishedConsumeWork, MaxAge, TransactionBatchId, TransactionId,
-        },
-        transaction_scheduler::thread_aware_account_locks::MAX_THREADS,
+    crate::banking_stage::scheduler_messages::{
+        ConsumeWork, FinishedConsumeWork, MaxAge, TransactionBatchId, TransactionId,
+    },
+    agave_scheduling_utils::thread_aware_account_locks::{
+        ThreadAwareAccountLocks, ThreadId, ThreadSet, MAX_THREADS,
     },
     crossbeam_channel::{Receiver, Sender, TryRecvError},
     itertools::izip,
@@ -23,19 +21,35 @@ pub struct Batches<Tx> {
     transactions: Vec<Vec<Tx>>,
     max_ages: Vec<Vec<MaxAge>>,
     total_cus: Vec<u64>,
+    target_num_transactions_per_batch: usize,
 }
 
 impl<Tx> Batches<Tx> {
     pub fn new(num_threads: usize, target_num_transactions_per_batch: usize) -> Self {
-        Self {
-            ids: vec![Vec::with_capacity(target_num_transactions_per_batch); num_threads],
-
-            transactions: (0..num_threads)
+        fn make_vecs<T>(
+            num_threads: usize,
+            target_num_transactions_per_batch: usize,
+        ) -> Vec<Vec<T>> {
+            (0..num_threads)
                 .map(|_| Vec::with_capacity(target_num_transactions_per_batch))
-                .collect(),
-            max_ages: vec![Vec::with_capacity(target_num_transactions_per_batch); num_threads],
-            total_cus: vec![0; num_threads],
+                .collect()
         }
+
+        Self {
+            ids: make_vecs(num_threads, target_num_transactions_per_batch),
+            transactions: make_vecs(num_threads, target_num_transactions_per_batch),
+            max_ages: make_vecs(num_threads, target_num_transactions_per_batch),
+            total_cus: vec![0; num_threads],
+            target_num_transactions_per_batch,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn is_empty(&self) -> bool {
+        self.ids.iter().all(|ids| ids.is_empty())
+            && self.transactions.iter().all(|txs| txs.is_empty())
+            && self.max_ages.iter().all(|max_ages| max_ages.is_empty())
+            && self.total_cus.iter().all(|&cus| cus == 0)
     }
 
     pub fn total_cus(&self) -> &[u64] {
@@ -63,20 +77,19 @@ impl<Tx> Batches<Tx> {
     pub fn take_batch(
         &mut self,
         thread_id: ThreadId,
-        target_num_transactions_per_batch: usize,
     ) -> (Vec<TransactionId>, Vec<Tx>, Vec<MaxAge>, u64) {
         (
             core::mem::replace(
                 &mut self.ids[thread_id],
-                Vec::with_capacity(target_num_transactions_per_batch),
+                Vec::with_capacity(self.target_num_transactions_per_batch),
             ),
             core::mem::replace(
                 &mut self.transactions[thread_id],
-                Vec::with_capacity(target_num_transactions_per_batch),
+                Vec::with_capacity(self.target_num_transactions_per_batch),
             ),
             core::mem::replace(
                 &mut self.max_ages[thread_id],
-                Vec::with_capacity(target_num_transactions_per_batch),
+                Vec::with_capacity(self.target_num_transactions_per_batch),
             ),
             core::mem::replace(&mut self.total_cus[thread_id], 0),
         )
@@ -137,12 +150,14 @@ pub(crate) struct SchedulingCommon<Tx> {
     pub(crate) finished_consume_work_receiver: Receiver<FinishedConsumeWork<Tx>>,
     pub(crate) in_flight_tracker: InFlightTracker,
     pub(crate) account_locks: ThreadAwareAccountLocks,
+    pub(crate) batches: Batches<Tx>,
 }
 
 impl<Tx> SchedulingCommon<Tx> {
     pub fn new(
         consume_work_senders: Vec<Sender<ConsumeWork<Tx>>>,
         finished_consume_work_receiver: Receiver<FinishedConsumeWork<Tx>>,
+        target_num_transactions_per_batch: usize,
     ) -> Self {
         let num_threads = consume_work_senders.len();
         assert!(num_threads > 0, "must have at least one worker");
@@ -151,6 +166,10 @@ impl<Tx> SchedulingCommon<Tx> {
             "cannot have more than {MAX_THREADS} workers"
         );
         Self {
+            batches: Batches::new(
+                consume_work_senders.len(),
+                target_num_transactions_per_batch,
+            ),
             consume_work_senders,
             finished_consume_work_receiver,
             in_flight_tracker: InFlightTracker::new(num_threads),
@@ -160,18 +179,12 @@ impl<Tx> SchedulingCommon<Tx> {
 
     /// Send a batch of transactions to the given thread's `ConsumeWork` channel.
     /// Returns the number of transactions sent.
-    pub fn send_batch(
-        &mut self,
-        batches: &mut Batches<Tx>,
-        thread_index: usize,
-        target_transactions_per_batch: usize,
-    ) -> Result<usize, SchedulerError> {
-        if batches.ids[thread_index].is_empty() {
+    pub fn send_batch(&mut self, thread_index: usize) -> Result<usize, SchedulerError> {
+        if self.batches.ids[thread_index].is_empty() {
             return Ok(0);
         }
 
-        let (ids, transactions, max_ages, total_cus) =
-            batches.take_batch(thread_index, target_transactions_per_batch);
+        let (ids, transactions, max_ages, total_cus) = self.batches.take_batch(thread_index);
 
         let batch_id = self
             .in_flight_tracker
@@ -193,15 +206,9 @@ impl<Tx> SchedulingCommon<Tx> {
 
     /// Send all batches of transactions to the worker threads.
     /// Returns the number of transactions sent.
-    pub fn send_batches(
-        &mut self,
-        batches: &mut Batches<Tx>,
-        target_transactions_per_batch: usize,
-    ) -> Result<usize, SchedulerError> {
+    pub fn send_batches(&mut self) -> Result<usize, SchedulerError> {
         (0..self.consume_work_senders.len())
-            .map(|thread_index| {
-                self.send_batch(batches, thread_index, target_transactions_per_batch)
-            })
+            .map(|thread_index| self.send_batch(thread_index))
             .sum()
     }
 }
@@ -233,9 +240,13 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
                 // Assumption - retryable indexes are in order (sorted by workers).
                 let mut retryable_iter = retryable_indexes.iter().peekable();
                 for (index, (id, transaction)) in izip!(ids, transactions).enumerate() {
-                    if let Some(&&retryable_index) = retryable_iter.peek() {
-                        if retryable_index == index {
-                            container.retry_transaction(id, transaction);
+                    if let Some(&retryable_index) = retryable_iter.peek() {
+                        if retryable_index.index == index {
+                            container.retry_transaction(
+                                id,
+                                transaction,
+                                retryable_index.immediately_retryable,
+                            );
                             retryable_iter.next();
                             continue;
                         }
@@ -245,7 +256,11 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
 
                 debug_assert!(
                     retryable_iter.peek().is_none(),
-                    "retryable indexes were not in order: {retryable_indexes:?}"
+                    "retryable indexes were not in order: {:?}",
+                    retryable_indexes
+                        .iter()
+                        .map(|index| index.index)
+                        .collect::<Vec<_>>(),
                 );
 
                 Ok((num_transactions, num_retryable))
@@ -281,12 +296,17 @@ impl<Tx: TransactionWithMeta> SchedulingCommon<Tx> {
 mod tests {
     use {
         super::*,
-        crate::banking_stage::transaction_scheduler::transaction_state_container::TransactionStateContainer,
+        crate::banking_stage::{
+            consumer::RetryableIndex,
+            transaction_scheduler::transaction_state_container::TransactionStateContainer,
+        },
         crossbeam_channel::unbounded,
+        solana_hash::Hash,
         solana_keypair::Keypair,
         solana_pubkey::Pubkey,
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
-        solana_hash::Hash, solana_system_transaction as system_transaction, solana_transaction::sanitized::SanitizedTransaction,
+        solana_system_transaction as system_transaction,
+        solana_transaction::sanitized::SanitizedTransaction,
         test_case::test_case,
     };
 
@@ -319,7 +339,6 @@ mod tests {
     fn pop_and_add_transaction<Tx: TransactionWithMeta>(
         container: &mut TransactionStateContainer<Tx>,
         common: &mut SchedulingCommon<Tx>,
-        batches: &mut Batches<Tx>,
         thread_id: ThreadId,
     ) {
         let tx_id = container.pop().unwrap();
@@ -347,7 +366,13 @@ mod tests {
                 |_thread_set| thread_id,
             )
             .unwrap();
-        batches.add_transaction_to_batch(thread_id, tx_id.id, transaction, max_age, DUMMY_COST);
+        common.batches.add_transaction_to_batch(
+            thread_id,
+            tx_id.id,
+            transaction,
+            max_age,
+            DUMMY_COST,
+        );
     }
 
     #[test_case(
@@ -432,11 +457,10 @@ mod tests {
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
             (0..NUM_WORKERS).map(|_| unbounded()).unzip();
         let (_finished_work_sender, finished_work_receiver) = unbounded();
-        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver);
-        let mut batches = Batches::new(NUM_WORKERS, 10);
+        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
 
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        let num_scheduled = common.send_batch(0).unwrap();
         assert_eq!(num_scheduled, 1);
         assert_eq!(work_receivers[0].len(), 1);
         assert_eq!(
@@ -448,17 +472,17 @@ mod tests {
             &[DUMMY_COST, 0, 0, 0]
         );
 
-        let num_scheduled = common.send_batch(&mut batches, 1, 10).unwrap();
+        let num_scheduled = common.send_batch(1).unwrap();
         assert_eq!(num_scheduled, 0);
         assert_eq!(work_receivers[1].len(), 0); // not actually sent since no transactions.
 
         work_receivers[0].recv().unwrap();
 
         // Multiple batches.
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 2);
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        pop_and_add_transaction(&mut container, &mut common, 2);
 
-        common.send_batches(&mut batches, 10).unwrap();
+        common.send_batches().unwrap();
         assert_eq!(work_receivers[0].len(), 1);
         assert_eq!(work_receivers[1].len(), 0);
         assert_eq!(work_receivers[2].len(), 1);
@@ -481,12 +505,11 @@ mod tests {
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
             (0..NUM_WORKERS).map(|_| unbounded()).unzip();
         let (finished_work_sender, finished_work_receiver) = unbounded();
-        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver);
-        let mut batches = Batches::new(NUM_WORKERS, 10);
+        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
 
         // Send a batch. Return completed work.
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        let num_scheduled = common.send_batch(0).unwrap();
 
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
@@ -505,23 +528,28 @@ mod tests {
 
         // Retryable indexes.
         add_transactions_to_container(&mut container, 3);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        let num_scheduled = common.send_batch(0).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
-        let retryable_indexes = vec![0, 1];
+        let retryable_indexes = vec![
+            RetryableIndex::new(0, true),
+            RetryableIndex::new(1, false), // should be held by container.
+        ];
+        let expected_num_retryable = retryable_indexes.len();
         let finished_work = FinishedConsumeWork {
             work,
-            retryable_indexes: retryable_indexes.clone(),
+            retryable_indexes,
         };
         finished_work_sender.send(finished_work).unwrap();
         let (num_transactions, num_retryable) =
             common.try_receive_completed(&mut container).unwrap();
         assert_eq!(num_transactions, num_scheduled);
-        assert_eq!(num_retryable, retryable_indexes.len());
-        assert_eq!(container.buffer_size(), retryable_indexes.len());
+        assert_eq!(num_retryable, expected_num_retryable);
+        assert_eq!(container.buffer_size(), expected_num_retryable);
+        assert_eq!(container.queue_size(), expected_num_retryable - 1); // held transaction not in queue.
     }
 
     #[test]
@@ -532,19 +560,18 @@ mod tests {
         let (work_senders, work_receivers): (Vec<Sender<_>>, Vec<Receiver<_>>) =
             (0..NUM_WORKERS).map(|_| unbounded()).unzip();
         let (finished_work_sender, finished_work_receiver) = unbounded();
-        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver);
-        let mut batches = Batches::new(NUM_WORKERS, 10);
+        let mut common = SchedulingCommon::new(work_senders, finished_work_receiver, 10);
         // Retryable indexes out-of-order.
         add_transactions_to_container(&mut container, 2);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        pop_and_add_transaction(&mut container, &mut common, &mut batches, 0);
-        let num_scheduled = common.send_batch(&mut batches, 0, 10).unwrap();
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        pop_and_add_transaction(&mut container, &mut common, 0);
+        let num_scheduled = common.send_batch(0).unwrap();
         let work = work_receivers[0].try_recv().unwrap();
         assert_eq!(work.ids.len(), num_scheduled);
-        let retryable_indexes = vec![1, 0];
+        let retryable_indexes = vec![RetryableIndex::new(1, true), RetryableIndex::new(0, true)];
         let finished_work = FinishedConsumeWork {
             work,
-            retryable_indexes: retryable_indexes.clone(),
+            retryable_indexes,
         };
         finished_work_sender.send(finished_work).unwrap();
 

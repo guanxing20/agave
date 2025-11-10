@@ -1,6 +1,6 @@
 use {
     crate::update_manifest::UpdateManifest,
-    serde_derive::{Deserialize, Serialize},
+    serde::{Deserialize, Serialize},
     solana_pubkey::Pubkey,
     std::{
         fs::{create_dir_all, File},
@@ -77,7 +77,7 @@ impl Config {
                 })
         });
         if result.is_err() {
-            eprintln!("config upgrade failed! restoring orignal");
+            eprintln!("config upgrade failed! restoring original");
             let restored = std::fs::copy(&bak_filename, config_file)
                 .and_then(|_| std::fs::remove_file(&bak_filename));
             if restored.is_err() {

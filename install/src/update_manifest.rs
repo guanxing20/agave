@@ -1,6 +1,5 @@
 use {
-    serde_derive::{Deserialize, Serialize},
-    solana_config_program_client::instructions_bincode::ConfigState,
+    serde::{Deserialize, Serialize},
     solana_hash::Hash,
     solana_keypair::signable::Signable,
     solana_pubkey::Pubkey,
@@ -30,7 +29,7 @@ impl Signable for SignedUpdateManifest {
         self.account_pubkey
     }
 
-    fn signable_data(&self) -> Cow<[u8]> {
+    fn signable_data(&self) -> Cow<'_, [u8]> {
         Cow::Owned(bincode::serialize(&self.manifest).expect("serialize"))
     }
     fn get_signature(&self) -> Signature {
@@ -42,6 +41,8 @@ impl Signable for SignedUpdateManifest {
 }
 
 impl SignedUpdateManifest {
+    pub const MAX_SPACE: u64 = 256; // Enough space for a fully populated SignedUpdateManifest
+
     pub fn deserialize(
         account_pubkey: &Pubkey,
         input: &[u8],
@@ -53,11 +54,5 @@ impl SignedUpdateManifest {
         } else {
             Ok(manifest)
         }
-    }
-}
-
-impl ConfigState for SignedUpdateManifest {
-    fn max_space() -> u64 {
-        256 // Enough space for a fully populated SignedUpdateManifest
     }
 }

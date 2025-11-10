@@ -11,7 +11,7 @@ use {
         cluster_info::ClusterInfo, contact_info::ContactInfo, crds::Cursor, epoch_slots::EpochSlots,
     },
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, epoch_stakes::EpochStakes},
+    solana_runtime::{bank::Bank, epoch_stakes::VersionedEpochStakes},
     solana_time_utils::AtomicInterval,
     std::{
         collections::{HashMap, VecDeque},
@@ -42,8 +42,8 @@ struct EpochStakeInfo {
     total_stake: Stake,
 }
 
-impl From<&EpochStakes> for EpochStakeInfo {
-    fn from(stakes: &EpochStakes) -> Self {
+impl From<&VersionedEpochStakes> for EpochStakeInfo {
+    fn from(stakes: &VersionedEpochStakes) -> Self {
         let validator_stakes = ValidatorStakesMap::from_iter(
             stakes
                 .node_id_to_vote_accounts()
@@ -74,7 +74,7 @@ struct RootEpoch {
     number: Epoch,
     schedule: EpochSchedule,
 }
-#[derive(Default)]
+
 pub struct ClusterSlots {
     // ring buffer storing, per slot, which stakes were committed to a certain slot.
     cluster_slots: RwLock<VecDeque<RowContent>>,
@@ -95,6 +95,31 @@ struct RowContent {
 }
 
 impl ClusterSlots {
+    pub fn new(root_bank: &Bank, cluster_info: &ClusterInfo) -> Self {
+        let cluster_slots = Self::default();
+        cluster_slots.update(root_bank, cluster_info);
+        cluster_slots
+    }
+
+    // Intentionally private default function to disallow uninitialized construction
+    fn default() -> Self {
+        Self {
+            cluster_slots: RwLock::new(VecDeque::new()),
+            epoch_metadata: RwLock::new(HashMap::new()),
+            current_slot: AtomicU64::default(),
+            root_epoch: RwLock::new(None),
+            cursor: Mutex::new(Cursor::default()),
+            metrics_last_report: AtomicInterval::default(),
+            metric_allocations: AtomicU64::default(),
+            metric_write_locks: AtomicU64::default(),
+        }
+    }
+
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn default_for_tests() -> Self {
+        Self::default()
+    }
+
     #[inline]
     pub(crate) fn lookup(&self, slot: Slot) -> Option<Arc<SlotSupporters>> {
         let cluster_slots = self.cluster_slots.read().unwrap();
@@ -247,7 +272,7 @@ impl ClusterSlots {
         let epoch_metadata = self.epoch_metadata.read().unwrap();
         //startup init, this is very slow but only ever happens once
         if cluster_slots.is_empty() {
-            info!("Init cluster_slots at range {:?}", slot_range);
+            info!("Init cluster_slots at range {slot_range:?}");
             for slot in slot_range.clone() {
                 // Epoch should be defined for all slots in the window
                 let epoch = self
@@ -293,7 +318,10 @@ impl ClusterSlots {
                 .get_epoch_for_slot(slot)
                 .expect("Epoch should be defined for all slots in the window");
             let Some(stake_info) = epoch_metadata.get(&epoch) else {
-                warn!("Epoch slots can not reuse slot entry for slot {slot} since stakes for epoch {epoch} are not available");
+                warn!(
+                    "Epoch slots can not reuse slot entry for slot {slot} since stakes for epoch \
+                     {epoch} are not available"
+                );
                 cluster_slots.push_back(RowContent {
                     slot,
                     supporters: Arc::new(SlotSupporters::new_blank()),
@@ -515,8 +543,7 @@ mod tests {
             assert_eq!(
                 rg.len(),
                 CLUSTER_SLOTS_TRIM_SIZE,
-                "ring should have exactly {} elements",
-                CLUSTER_SLOTS_TRIM_SIZE
+                "ring should have exactly {CLUSTER_SLOTS_TRIM_SIZE} elements"
             );
             assert_eq!(rg.front().unwrap().slot, 1, "first slot should be root + 1");
             assert_eq!(
@@ -695,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_best_peer_3() {
-        solana_logger::setup_with_default("info");
+        agave_logger::setup_with_default("info");
         let cs = ClusterSlots::default();
         let pk1 = Pubkey::new_unique();
         let pk2 = Pubkey::new_unique();
